@@ -68,6 +68,7 @@ class MockStoreClient : public StoreClient {
                const std::string &key,
                Postable<void(bool)> callback),
               (override));
+  MOCK_METHOD(void, AsyncCheckHealth, (Postable<void(Status)> callback), (override));
 };
 
 }  // namespace gcs

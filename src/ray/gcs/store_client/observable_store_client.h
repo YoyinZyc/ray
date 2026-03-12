@@ -75,6 +75,8 @@ class ObservableStoreClient : public StoreClient {
                    const std::string &key,
                    Postable<void(bool)> callback) override;
 
+  void AsyncCheckHealth(Postable<void(Status)> callback) override;
+
  private:
   std::unique_ptr<StoreClient> delegate_;
   ray::observability::MetricInterface &storage_operation_latency_in_ms_histogram_;

@@ -70,6 +70,8 @@ class InMemoryStoreClient : public StoreClient {
                    const std::string &key,
                    Postable<void(bool)> callback) override;
 
+  void AsyncCheckHealth(Postable<void(Status)> callback) override;
+
  private:
   // The returned reference is valid as long as the InMemoryStoreClient is alive and
   // as long as no other thread erases the InMemoryTable from tables_.

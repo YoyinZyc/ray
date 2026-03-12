@@ -155,38 +155,23 @@ GcsServer::GcsServer(const ray::gcs::GcsServerConfig &config,
   RAY_LOG(INFO).WithField(gcs_node_id_) << "GCS node ID initialized from config";
 
   auto &io_context = io_context_provider_.GetDefaultIOContext();
-  std::shared_ptr<StoreClient> store_client;
-  switch (storage_type_) {
-  case StorageType::IN_MEMORY:
-    store_client = std::make_shared<ObservableStoreClient>(
-        std::make_unique<InMemoryStoreClient>(),
-        metrics_.storage_operation_latency_in_ms_histogram,
-        metrics_.storage_operation_count_counter);
-    break;
-  case StorageType::REDIS_PERSIST: {
-    auto redis_store_client =
-        std::make_shared<RedisStoreClient>(io_context, GetRedisClientOptions());
-    // Health check Redis periodically and crash if it becomes unavailable.
-    // NOTE: periodical_runner_ must run on the same IO context as the Redis client.
+  store_client_ = CreateStoreClient(io_context);
+
+  // Health check storage periodically and crash if it becomes unavailable.
+  if (storage_type_ != StorageType::IN_MEMORY) {
     periodical_runner_->RunFnPeriodically(
-        [redis_store_client, &io_context] {
-          redis_store_client->AsyncCheckHealth(
+        [this, &io_context] {
+          store_client_->AsyncCheckHealth(
               {[](const Status &status) {
-                 RAY_CHECK_OK(status) << "Redis connection failed unexpectedly.";
+                 RAY_CHECK_OK(status) << "Storage connection failed unexpectedly.";
                },
                io_context});
         },
-        RayConfig::instance().gcs_redis_heartbeat_interval_milliseconds(),
-        "GCSServer.redis_health_check");
-
-    store_client = redis_store_client;
-    break;
-  }
-  default:
-    RAY_LOG(FATAL) << "Unexpected storage type: " << storage_type_;
+        RayConfig::instance().gcs_storage_heartbeat_interval_milliseconds(),
+        "GCSServer.storage_health_check");
   }
 
-  gcs_table_storage_ = std::make_unique<GcsTableStorage>(std::move(store_client));
+  gcs_table_storage_ = std::make_unique<GcsTableStorage>(store_client_);
 
   auto inner_publisher = std::make_unique<pubsub::Publisher>(
       /*channels=*/
@@ -628,24 +613,9 @@ void GcsServer::InitUsageStatsClient() {
 
 void GcsServer::InitKVManager() {
   auto &io_context = io_context_provider_.GetIOContext<GcsInternalKVManager>();
-  std::unique_ptr<StoreClient> store_client;
-  switch (storage_type_) {
-  case (StorageType::REDIS_PERSIST):
-    store_client =
-        std::make_unique<RedisStoreClient>(io_context, GetRedisClientOptions());
-    break;
-  case (StorageType::IN_MEMORY):
-    store_client = std::make_unique<ObservableStoreClient>(
-        std::make_unique<InMemoryStoreClient>(),
-        metrics_.storage_operation_latency_in_ms_histogram,
-        metrics_.storage_operation_count_counter);
-    break;
-  default:
-    RAY_LOG(FATAL) << "Unexpected storage type! " << storage_type_;
-  }
 
   kv_manager_ = std::make_unique<GcsInternalKVManager>(
-      std::make_unique<StoreClientInternalKV>(std::move(store_client)),
+      std::make_unique<StoreClientInternalKV>(store_client_),
       config_.raylet_config_list,
       io_context);
 
@@ -964,6 +934,26 @@ void GcsServer::InitMetricsExporter(int metrics_agent_port) {
           << "Exporter agent status: " << server_status.ToString();
     }
   });
+}
+
+std::shared_ptr<StoreClient> GcsServer::CreateStoreClient(
+    instrumented_io_context &io_context) {
+  std::shared_ptr<StoreClient> store_client;
+  switch (storage_type_) {
+  case StorageType::IN_MEMORY:
+    store_client = std::make_shared<ObservableStoreClient>(
+        std::make_unique<InMemoryStoreClient>(),
+        metrics_.storage_operation_latency_in_ms_histogram,
+        metrics_.storage_operation_count_counter);
+    break;
+  case StorageType::REDIS_PERSIST:
+    store_client =
+        std::make_shared<RedisStoreClient>(io_context, GetRedisClientOptions());
+    break;
+  default:
+    RAY_LOG(FATAL) << "Unexpected storage type: " << storage_type_;
+  }
+  return store_client;
 }
 
 }  // namespace gcs

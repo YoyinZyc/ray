@@ -141,4 +141,8 @@ void InMemoryStoreClient::AsyncExists(const std::string &table_name,
   std::move(callback).Post("GcsInMemoryStore.Exists", result);
 }
 
+void InMemoryStoreClient::AsyncCheckHealth(Postable<void(Status)> callback) {
+  std::move(callback).Post("GcsInMemoryStore.CheckHealth", Status::OK());
+}
+
 }  // namespace ray::gcs

@@ -117,6 +117,11 @@ class StoreClient {
                            const std::string &key,
                            Postable<void(bool)> callback) = 0;
 
+  /// Check whether the storage is available.
+  ///
+  /// \param callback The callback that will be called with a Status. OK means healthy.
+  virtual void AsyncCheckHealth(Postable<void(Status)> callback) = 0;
+
  protected:
   StoreClient() = default;
 };

@@ -145,6 +145,10 @@ void ObservableStoreClient::AsyncExists(const std::string &table_name,
       }));
 }
 
+void ObservableStoreClient::AsyncCheckHealth(Postable<void(Status)> callback) {
+  delegate_->AsyncCheckHealth(std::move(callback));
+}
+
 }  // namespace gcs
 
 }  // namespace ray

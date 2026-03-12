@@ -384,6 +384,9 @@ RAY_CONFIG(uint32_t,
            gcs_server_rpc_client_thread_num,
            std::max(1U, std::thread::hardware_concurrency() / 4U))
 
+/// The interval between GCS storage heartbeat.
+RAY_CONFIG(uint64_t, gcs_storage_heartbeat_interval_milliseconds, 100)
+
 /// The interval at which the gcs server will health check the connection to the
 /// external Redis server. If a health check fails, the GCS will crash itself.
 /// Set to zero to disable health checking.

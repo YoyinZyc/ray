@@ -172,7 +172,7 @@ class RedisStoreClient : public StoreClient {
   // Check if Redis is available.
   //
   // \param callback The callback that will be called with a Status. OK means healthy.
-  void AsyncCheckHealth(Postable<void(Status)> callback);
+  void AsyncCheckHealth(Postable<void(Status)> callback) override;
 
  private:
   /// \class RedisScanner

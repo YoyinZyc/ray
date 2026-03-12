@@ -233,6 +233,8 @@ class GcsServer {
 
   RedisClientOptions GetRedisClientOptions();
 
+  std::shared_ptr<StoreClient> CreateStoreClient(instrumented_io_context &io_context);
+
   /// GCS server metrics
   const ray::gcs::GcsServerMetrics &metrics_;
   IOContextProvider<GcsServerIOContextPolicy> io_context_provider_;
@@ -243,6 +245,8 @@ class GcsServer {
   const GcsServerConfig config_;
   // Type of storage to use.
   const StorageType storage_type_;
+  // The client to the GCS storage.
+  std::shared_ptr<StoreClient> store_client_;
   /// The grpc server
   rpc::GrpcServer rpc_server_;
   /// The `ClientCallManager` object that is shared by all `RayletClient`s.
