@@ -52,6 +52,8 @@ inline std::ostream &operator<<(std::ostream &str, GcsServer::StorageType val) {
     return str << "StorageType::IN_MEMORY";
   case GcsServer::StorageType::REDIS_PERSIST:
     return str << "StorageType::REDIS_PERSIST";
+  case GcsServer::StorageType::ETCD_PERSIST:
+    return str << "StorageType::ETCD_PERSIST";
   case GcsServer::StorageType::UNKNOWN:
     return str << "StorageType::UNKNOWN";
   default:
@@ -949,6 +951,9 @@ std::shared_ptr<StoreClient> GcsServer::CreateStoreClient(
   case StorageType::REDIS_PERSIST:
     store_client =
         std::make_shared<RedisStoreClient>(io_context, GetRedisClientOptions());
+    break;
+  case StorageType::ETCD_PERSIST:
+    RAY_LOG(FATAL) << "Etcd storage is not implemented yet.";
     break;
   default:
     RAY_LOG(FATAL) << "Unexpected storage type: " << storage_type_;

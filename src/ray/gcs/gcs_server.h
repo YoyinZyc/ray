@@ -128,6 +128,7 @@ class GcsServer {
     UNKNOWN = 0,
     IN_MEMORY = 1,
     REDIS_PERSIST = 2,
+    ETCD_PERSIST = 3,
   };
 
   static constexpr char kInMemoryStorage[] = "memory";
