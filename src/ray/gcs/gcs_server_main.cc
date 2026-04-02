@@ -56,9 +56,25 @@ DEFINE_string(node_id, "", "The ID of the node where GCS runs (head node).");
 DEFINE_string(session_name, "", "session_name: The current Ray session name.");
 DEFINE_string(ray_commit, "", "The commit hash of Ray.");
 DEFINE_string(session_dir, "", "The path of this ray session directory.");
+DEFINE_string(gcs_sidecar_url, "", "The URL of the sidecar for leader status polling (e.g., http://localhost:4040/status).");
+DEFINE_int32(gcs_polling_interval_ms, 500, "The polling interval in milliseconds for leader status.");
 
 int main(int argc, char *argv[]) {
   gflags::ParseCommandLineFlags(&argc, &argv, true);
+
+  // Fallback to environment variables if flags are not set or are default.
+  if (FLAGS_gcs_sidecar_url.empty()) {
+    const char *env_url = std::getenv("RAY_GCS_SIDECAR_URL");
+    if (env_url) {
+      FLAGS_gcs_sidecar_url = env_url;
+    }
+  }
+  if (FLAGS_gcs_polling_interval_ms == 500) {
+    const char *env_interval = std::getenv("RAY_GCS_POLLING_INTERVAL_MS");
+    if (env_interval) {
+      FLAGS_gcs_polling_interval_ms = std::stoi(env_interval);
+    }
+  }
 
   if (!FLAGS_stdout_filepath.empty()) {
     ray::StreamRedirectionOption stdout_redirection_options;
@@ -177,6 +193,8 @@ int main(int argc, char *argv[]) {
   gcs_server_config.log_dir = log_dir;
   gcs_server_config.raylet_config_list = config_list;
   gcs_server_config.session_name = session_name;
+  gcs_server_config.gcs_sidecar_url = FLAGS_gcs_sidecar_url;
+  gcs_server_config.gcs_polling_interval_ms = FLAGS_gcs_polling_interval_ms;
 
   // Create individual metrics
   auto actor_by_state_gauge = ray::GetActorByStateGaugeMetric();

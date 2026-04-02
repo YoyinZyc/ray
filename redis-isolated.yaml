@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-shadow
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-shadow
+  template:
+    metadata:
+      labels:
+        app: redis-shadow
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-shadow
+  namespace: default
+spec:
+  selector:
+    app: redis-shadow
+  ports:
+  - protocol: TCP
+    port: 6379
+    targetPort: 6379

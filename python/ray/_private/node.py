@@ -744,7 +744,7 @@ class Node:
                     cluster_id=self._ray_params.cluster_id,  # Hex string
                 )
                 self.cluster_id = client.cluster_id
-                if self.head:
+                if self.head and os.environ.get("RAY_GCS_SHADOW_MODE") != "1":
                     # Send a simple request to make sure GCS is alive
                     # if it's a head node.
                     client.internal_kv_get(b"dummy", None)

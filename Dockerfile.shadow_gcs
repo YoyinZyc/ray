@@ -1,0 +1,47 @@
+# Stage 1: Builder
+FROM ubuntu:20.04 AS builder
+
+# Avoid interactive prompts during apt-get
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install dependencies for building Ray
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    git \
+    python3 \
+    python3-dev \
+    python3-pip \
+    unzip \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Bazel (using bazelisk)
+RUN curl -L https://github.com/bazelbuild/bazelisk/releases/download/v1.19.0/bazelisk-linux-amd64 -o /usr/local/bin/bazelisk && \
+    chmod +x /usr/local/bin/bazelisk && \
+    ln -s /usr/local/bin/bazelisk /usr/local/bin/bazel
+
+WORKDIR /ray
+
+# Copy the entire source tree
+# Note: This will copy everything in the current directory, including ignored files if not in .dockerignore
+# But we need it to build with Bazel.
+COPY . .
+
+# Build GCS server
+# We use --jobs to limit concurrency if needed, but let's trust Bazel to handle it.
+RUN bazel build //src/ray/gcs:gcs_server
+
+# Stage 2: Final Image
+FROM rayproject/ray:2.54.0
+
+# Copy the built GCS server from the builder stage
+# Overwriting the existing one in the Ray installation directory
+COPY --chown=ray:users --from=builder /ray/bazel-bin/src/ray/gcs/gcs_server /home/ray/anaconda3/lib/python3.10/site-packages/ray/core/src/ray/gcs/gcs_server
+
+# Copy the modified node.py (assumed to be in the build context)
+COPY --chown=ray:users node_2.54.0.py /home/ray/anaconda3/lib/python3.10/site-packages/ray/_private/node.py
+
+# Ensure correct permissions
+RUN chmod +x /home/ray/anaconda3/lib/python3.10/site-packages/ray/core/src/ray/gcs/gcs_server && \
+    chmod 644 /home/ray/anaconda3/lib/python3.10/site-packages/ray/_private/node.py

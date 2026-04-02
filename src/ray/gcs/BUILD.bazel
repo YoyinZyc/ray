@@ -474,6 +474,7 @@ ray_cc_binary(
         "//conditions:default": [],
     }),
     visibility = ["//visibility:public"],
+    linkstatic = True,
     deps = [
         ":gcs_server_lib",
         "//src/ray/common:metrics",

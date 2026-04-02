@@ -70,6 +70,8 @@ struct GcsServerConfig {
   // This includes the config list of raylet.
   std::string raylet_config_list;
   std::string session_name;
+  std::string gcs_sidecar_url;
+  uint32_t gcs_polling_interval_ms = 500;
 };
 
 class GcsNodeManager;
@@ -102,6 +104,12 @@ class GcsServer {
 
   /// Start gcs server.
   void Start();
+
+  /// Load GCS tables data and proceed to DoStart.
+  void DoStartLoading();
+
+  /// Deferred loading of GCS tables data after promotion.
+  void DoStartLoadingDeferred();
 
   /// Stop gcs server.
   void Stop();
@@ -218,6 +226,9 @@ class GcsServer {
  private:
   /// Gets the type of KV storage to use from config.
   StorageType GetStorageType() const;
+
+  /// Poll the sidecar for leadership status.
+  bool PollSidecar(const std::string &url) const;
 
   /// Print debug info periodically.
   void PrintDebugState() const;

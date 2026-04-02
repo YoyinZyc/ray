@@ -19,6 +19,13 @@
 #include <utility>
 #include <vector>
 
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/beast/version.hpp>
+#include <boost/asio/connect.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <nlohmann/json.hpp>
+
 #include "ray/common/asio/asio_util.h"
 #include "ray/common/asio/instrumented_io_context.h"
 #include "ray/common/ray_config.h"
@@ -211,6 +218,64 @@ GcsServer::GcsServer(const ray::gcs::GcsServerConfig &config,
 GcsServer::~GcsServer() { Stop(); }
 
 void GcsServer::Start() {
+  if (!config_.gcs_sidecar_url.empty()) {
+    RAY_LOG(INFO) << "Starting in Shadow mode, polling sidecar at " << config_.gcs_sidecar_url;
+    
+    // We want to start the RPC server early in read-only mode, but defer loading Redis data.
+    // So we first get the cluster ID from Redis to initialize the RPC server correctly.
+    InitKVManager();
+    auto empty_gcs_init_data = std::make_shared<GcsInitData>(*gcs_table_storage_);
+    
+    GetOrGenerateClusterId(
+        {[this, empty_gcs_init_data](ClusterID cluster_id) {
+           rpc_server_.SetClusterId(cluster_id);
+           // Start RPC server with empty state.
+           DoStart(*empty_gcs_init_data);
+           
+           auto is_leader = std::make_shared<bool>(false);
+           periodical_runner_->RunFnPeriodically(
+               [this, is_leader] {
+                 bool sidecar_leader = PollSidecar(config_.gcs_sidecar_url);
+                 
+                 if (*is_leader) {
+                   if (!sidecar_leader) {
+                     RAY_LOG(FATAL) << "Lost leadership from sidecar! Aborting to prevent split-brain.";
+                   }
+                   return;
+                 }
+                 
+                 if (sidecar_leader) {
+                   RAY_LOG(INFO) << "Acquired leadership from sidecar, promoting GCS.";
+                   *is_leader = true;
+                   this->DoStartLoadingDeferred();
+                 }
+               },
+               config_.gcs_polling_interval_ms,
+               "GcsServer.poll_sidecar");
+        },
+        io_context_provider_.GetDefaultIOContext()});
+        
+  } else {
+    DoStartLoading();
+  }
+}
+
+void GcsServer::DoStartLoadingDeferred() {
+  RAY_LOG(INFO) << "Deferred loading of GCS tables data.";
+  auto gcs_init_data = std::make_shared<GcsInitData>(*gcs_table_storage_);
+  gcs_init_data->AsyncLoad({[this, gcs_init_data] {
+    RAY_LOG(INFO) << "Loaded data from Redis, initializing managers.";
+    gcs_node_manager_->Initialize(*gcs_init_data);
+    gcs_resource_manager_->Initialize(*gcs_init_data);
+    gcs_job_manager_->Initialize(*gcs_init_data);
+    gcs_placement_group_manager_->Initialize(*gcs_init_data);
+    gcs_actor_manager_->Initialize(*gcs_init_data);
+    gcs_autoscaler_state_manager_->Initialize(*gcs_init_data);
+    RAY_LOG(INFO) << "GCS Shadow Head promoted and initialized.";
+  }, io_context_provider_.GetDefaultIOContext()});
+}
+
+void GcsServer::DoStartLoading() {
   // Load gcs tables data asynchronously.
   auto gcs_init_data = std::make_shared<GcsInitData>(*gcs_table_storage_);
   // Init KV Manager. This needs to be initialized first here so that
@@ -225,6 +290,56 @@ void GcsServer::Start() {
                                    io_context_provider_.GetDefaultIOContext()});
                             },
                             io_context_provider_.GetDefaultIOContext()});
+}
+
+bool GcsServer::PollSidecar(const std::string &url) const {
+  std::string host = "localhost";
+  std::string port = "4040";
+  std::string target = "/status";
+  
+  if (url.substr(0, 7) == "http://") {
+    size_t colon_pos = url.find(':', 7);
+    size_t slash_pos = url.find('/', 7);
+    if (colon_pos != std::string::npos && slash_pos != std::string::npos) {
+      host = url.substr(7, colon_pos - 7);
+      port = url.substr(colon_pos + 1, slash_pos - colon_pos - 1);
+      target = url.substr(slash_pos);
+    }
+  }
+
+  try {
+    namespace beast = boost::beast;
+    namespace http = beast::http;
+    namespace net = boost::asio;
+    using tcp = net::ip::tcp;
+
+    net::io_context ioc;
+    tcp::resolver resolver(ioc);
+    beast::tcp_stream stream(ioc);
+
+    auto const results = resolver.resolve(host, port);
+    stream.connect(results);
+
+    http::request<http::string_body> req{http::verb::get, target, 11};
+    req.set(http::field::host, host);
+    req.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
+
+    http::write(stream, req);
+
+    beast::flat_buffer buffer;
+    http::response<http::string_body> res;
+    http::read(stream, buffer, res);
+
+    if (res.result() == http::status::ok) {
+      auto json = nlohmann::json::parse(res.body());
+      if (json.contains("is_leader") && json["is_leader"].is_boolean()) {
+        return json["is_leader"].get<bool>();
+      }
+    }
+  } catch (const std::exception &e) {
+    RAY_LOG(WARNING) << "Failed to poll sidecar at " << url << ": " << e.what();
+  }
+  return false;
 }
 
 void GcsServer::GetOrGenerateClusterId(
