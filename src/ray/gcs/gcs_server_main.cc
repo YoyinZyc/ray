@@ -56,10 +56,32 @@ DEFINE_string(node_id, "", "The ID of the node where GCS runs (head node).");
 DEFINE_string(session_name, "", "session_name: The current Ray session name.");
 DEFINE_string(ray_commit, "", "The commit hash of Ray.");
 DEFINE_string(session_dir, "", "The path of this ray session directory.");
+DEFINE_int32(gcs_polling_interval_ms, 500, "The polling interval in milliseconds for leader status.");
+DEFINE_string(gcs_leader_lease_name, "", "The name of the K8s Lease object for leader election.");
+DEFINE_string(gcs_leader_lease_namespace, "", "The namespace of the K8s Lease object for leader election.");
 
 int main(int argc, char *argv[]) {
   gflags::ParseCommandLineFlags(&argc, &argv, true);
 
+  // Fallback to environment variables if flags are not set or are default.
+  if (FLAGS_gcs_polling_interval_ms == 500) {
+    const char *env_interval = std::getenv("RAY_GCS_POLLING_INTERVAL_MS");
+    if (env_interval) {
+      FLAGS_gcs_polling_interval_ms = std::stoi(env_interval);
+    }
+  }
+  if (FLAGS_gcs_leader_lease_name.empty()) {
+    const char *env_lease_name = std::getenv("RAY_GCS_LEADER_LEASE_NAME");
+    if (env_lease_name) {
+      FLAGS_gcs_leader_lease_name = env_lease_name;
+    }
+  }
+  if (FLAGS_gcs_leader_lease_namespace.empty()) {
+    const char *env_lease_ns = std::getenv("RAY_GCS_LEADER_LEASE_NAMESPACE");
+    if (env_lease_ns) {
+      FLAGS_gcs_leader_lease_namespace = env_lease_ns;
+    }
+  }
   if (!FLAGS_stdout_filepath.empty()) {
     ray::StreamRedirectionOption stdout_redirection_options;
     stdout_redirection_options.file_path = FLAGS_stdout_filepath;
@@ -177,6 +199,9 @@ int main(int argc, char *argv[]) {
   gcs_server_config.log_dir = log_dir;
   gcs_server_config.raylet_config_list = config_list;
   gcs_server_config.session_name = session_name;
+  gcs_server_config.gcs_polling_interval_ms = FLAGS_gcs_polling_interval_ms;
+  gcs_server_config.gcs_leader_lease_name = FLAGS_gcs_leader_lease_name;
+  gcs_server_config.gcs_leader_lease_namespace = FLAGS_gcs_leader_lease_namespace;
 
   // Create individual metrics
   auto actor_by_state_gauge = ray::GetActorByStateGaugeMetric();
