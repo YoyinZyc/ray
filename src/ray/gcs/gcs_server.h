@@ -70,6 +70,9 @@ struct GcsServerConfig {
   // This includes the config list of raylet.
   std::string raylet_config_list;
   std::string session_name;
+  uint32_t gcs_polling_interval_ms = 500;
+  std::string gcs_leader_lease_name;
+  std::string gcs_leader_lease_namespace;
 };
 
 class GcsNodeManager;
@@ -219,6 +222,8 @@ class GcsServer {
   /// Gets the type of KV storage to use from config.
   StorageType GetStorageType() const;
 
+  /// Poll the Kubernetes API for leadership status via Lease.
+  bool PollK8sLease() const;
   /// Print debug info periodically.
   void PrintDebugState() const;
 

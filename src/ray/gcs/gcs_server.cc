@@ -40,6 +40,7 @@
 #include "ray/pubsub/publisher.h"
 #include "ray/raylet_rpc_client/raylet_client.h"
 #include "ray/rpc/authentication/authentication_token_loader.h"
+#include "ray/rpc/authentication/k8s_util.h"
 #include "ray/stats/stats.h"
 #include "ray/util/network_util.h"
 
@@ -211,6 +212,64 @@ GcsServer::GcsServer(const ray::gcs::GcsServerConfig &config,
 GcsServer::~GcsServer() { Stop(); }
 
 void GcsServer::Start() {
+  if (!config_.gcs_leader_lease_name.empty()) {
+    RAY_LOG(INFO) << "Starting in Shadow mode, polling K8s Lease: " 
+                  << config_.gcs_leader_lease_namespace << "/" << config_.gcs_leader_lease_name;
+    
+    rpc::k8s::InitK8sClientConfig();
+    
+    InitKVManager();
+    auto empty_gcs_init_data = std::make_shared<GcsInitData>(*gcs_table_storage_);
+    
+    GetOrGenerateClusterId(
+        {[this, empty_gcs_init_data](ClusterID cluster_id) {
+           rpc_server_.SetClusterId(cluster_id);
+           DoStart(*empty_gcs_init_data);
+           
+           auto is_leader = std::make_shared<bool>(false);
+           periodical_runner_->RunFnPeriodically(
+               [this, is_leader] {
+                 bool k8s_leader = PollK8sLease();
+                 
+                 if (*is_leader) {
+                   if (!k8s_leader) {
+                     RAY_LOG(FATAL) << "Lost leadership from K8s Lease! Aborting to prevent split-brain.";
+                   }
+                   return;
+                 }
+                 
+                 if (k8s_leader) {
+                   RAY_LOG(INFO) << "Acquired leadership from K8s Lease, promoting GCS.";
+                   *is_leader = true;
+                   this->DoStartLoadingDeferred();
+                 }
+               },
+               config_.gcs_polling_interval_ms,
+               "GcsServer.poll_k8s_lease");
+        },
+        io_context_provider_.GetDefaultIOContext()});
+        
+  } else {
+    DoStartLoading();
+  }
+}
+
+void GcsServer::DoStartLoadingDeferred() {
+  RAY_LOG(INFO) << "Deferred loading of GCS tables data.";
+  auto gcs_init_data = std::make_shared<GcsInitData>(*gcs_table_storage_);
+  gcs_init_data->AsyncLoad({[this, gcs_init_data] {
+    RAY_LOG(INFO) << "Loaded data from Redis, initializing managers.";
+    gcs_node_manager_->Initialize(*gcs_init_data);
+    gcs_resource_manager_->Initialize(*gcs_init_data);
+    gcs_job_manager_->Initialize(*gcs_init_data);
+    gcs_placement_group_manager_->Initialize(*gcs_init_data);
+    gcs_actor_manager_->Initialize(*gcs_init_data);
+    gcs_autoscaler_state_manager_->Initialize(*gcs_init_data);
+    RAY_LOG(INFO) << "GCS Shadow Head promoted and initialized.";
+  }, io_context_provider_.GetDefaultIOContext()});
+}
+
+void GcsServer::DoStartLoading() {
   // Load gcs tables data asynchronously.
   auto gcs_init_data = std::make_shared<GcsInitData>(*gcs_table_storage_);
   // Init KV Manager. This needs to be initialized first here so that
@@ -227,6 +286,31 @@ void GcsServer::Start() {
                             io_context_provider_.GetDefaultIOContext()});
 }
 
+bool GcsServer::PollK8sLease() const {
+  std::string path = "/apis/coordination.k8s.io/v1/namespaces/" + config_.gcs_leader_lease_namespace + "/leases/" + config_.gcs_leader_lease_name;
+  nlohmann::json response;
+  
+  if (!rpc::k8s::K8sApiGet(path, response)) {
+    RAY_LOG(WARNING) << "Failed to get GCS leader lease from K8s API.";
+    return false;
+  }
+
+  try {
+    if (response.contains("spec") && response["spec"].contains("holderIdentity")) {
+      std::string holder = response["spec"]["holderIdentity"].get<std::string>();
+      const char *hostname = std::getenv("HOSTNAME");
+      if (hostname != nullptr) {
+        return holder == hostname;
+      } else {
+        RAY_LOG_EVERY_N(WARNING, 10) << "HOSTNAME environment variable not set. Cannot determine leadership.";
+      }
+    }
+  } catch (const std::exception &e) {
+    RAY_LOG(ERROR) << "Failed to parse Lease response: " << e.what();
+  }
+
+  return false;
+}
 void GcsServer::GetOrGenerateClusterId(
     Postable<void(ClusterID cluster_id)> continuation) {
   instrumented_io_context &io_context = continuation.io_context();
