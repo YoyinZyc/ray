@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "ray/gcs/gcs_server.h"
+#include "ray/gcs/leader_election/leader_election_client_factory.h"
 
 #include <memory>
 #include <string>
@@ -229,35 +230,12 @@ void GcsServer::Start() {
            
            // is_leader persists across iterations to track previous leadership state.
            auto is_leader = std::make_shared<bool>(false);
-           periodical_runner_->RunFnPeriodically(
-               [this, is_leader] {
-                 // k8s_leader holds the current leadership state from K8s API.
-                 bool k8s_leader = PollK8sLease(
-                     rpc::k8s::K8sApiGet,
-                     rpc::k8s::K8sApiPost,
-                     rpc::k8s::K8sApiPut);
-                 
-                 // State 1: We WERE leader in the previous iteration.
-                 if (*is_leader) {
-                   if (!k8s_leader) {
-                     // We failed to renew the lease! Fatal crash to prevent split-brain.
-                     RAY_LOG(FATAL) << "Lost leadership from K8s Lease! Aborting to prevent split-brain.";
-                   }
-                   // We are still the leader, no need to reload data.
-                   return;
-                 }
-                 
-                 // State 2: We were NOT leader, but now we ARE.
-                 if (k8s_leader) {
-                   RAY_LOG(INFO) << "Acquired leadership from K8s Lease, promoting GCS.";
-                   *is_leader = true;
-                   // Load data from Redis and initialize managers.
-                   this->DoStartLoadingDeferred();
-                 }
-                 // State 3: We were not leader, and still are not. Do nothing.
-               },
-               config_.gcs_polling_interval_ms,
-               "GcsServer.poll_k8s_lease");
+           // Instantiate the generic lease client via the platform-agnostic factory.
+           lease_client_ = LeaderLeaseClientFactory::Create(config_.gcs_leader_lease_namespace);
+
+
+           
+           this->StartLeaderElectionPolling();
         },
         io_context_provider_.GetDefaultIOContext()});
         
@@ -281,6 +259,52 @@ void GcsServer::DoStartLoadingDeferred() {
   }, io_context_provider_.GetDefaultIOContext()});
 }
 
+void GcsServer::StartLeaderElectionPolling() {
+  auto is_leader = std::make_shared<bool>(false);
+  
+  // Launch the background goroutine-style loop to completely isolate blocking leader lease network I/O.
+  lease_thread_ = std::make_unique<std::thread>([this, is_leader]() {
+    SetThreadName("GcsServer.poll_leader_lease");
+    
+    const char *hostname = std::getenv("HOSTNAME");
+    std::string my_id = hostname ? hostname : "unknown";
+
+    while (!is_stopped_) {
+      bool is_leader_current = false;
+      try {
+        if (*is_leader) {
+          is_leader_current = lease_client_->Renew(config_.gcs_leader_lease_name, my_id, 10000);
+        } else {
+          is_leader_current = lease_client_->TryAcquire(config_.gcs_leader_lease_name, my_id, 10000);
+        }
+      } catch (const std::exception &e) {
+        RAY_LOG(WARNING) << "Exception occurred during leader lease poll: " << e.what();
+        is_leader_current = false;
+      }
+
+      io_context_provider_.GetDefaultIOContext().post([this, is_leader_current, is_leader]() {
+        if (is_stopped_) {
+          return;
+        }
+        if (*is_leader) {
+          if (!is_leader_current) {
+            RAY_LOG(FATAL) << "Lost leadership from Lease! Aborting to prevent split-brain.";
+          }
+          return;
+        }
+        if (is_leader_current) {
+          RAY_LOG(INFO) << "Acquired leadership from Lease, promoting GCS.";
+          *is_leader = true;
+          this->DoStartLoadingDeferred();
+        }
+      }, "GcsServer.PromoteGcs");
+
+      // Sleep for polling interval without blocking the main IO thread.
+      std::this_thread::sleep_for(std::chrono::milliseconds(config_.gcs_polling_interval_ms));
+    }
+  });
+}
+
 void GcsServer::DoStartLoading() {
   // Load gcs tables data asynchronously.
   auto gcs_init_data = std::make_shared<GcsInitData>(*gcs_table_storage_);
@@ -298,122 +322,7 @@ void GcsServer::DoStartLoading() {
                             io_context_provider_.GetDefaultIOContext()});
 }
 
-bool GcsServer::PollK8sLease(
-    std::function<bool(const std::string &, nlohmann::json &)> get_api,
-    std::function<bool(const std::string &, const nlohmann::json &, nlohmann::json &)>
-        post_api,
-    std::function<bool(const std::string &, const nlohmann::json &, nlohmann::json &)>
-        put_api) const {
-  std::string get_path = "/apis/coordination.k8s.io/v1/namespaces/" +
-                         config_.gcs_leader_lease_namespace + "/leases/" +
-                         config_.gcs_leader_lease_name;
-  nlohmann::json response;
 
-  const char *hostname = std::getenv("HOSTNAME");
-  if (hostname == nullptr) {
-    RAY_LOG_EVERY_N(WARNING, 10)
-        << "HOSTNAME environment variable not set. Cannot determine leadership.";
-    return false;
-  }
-  std::string my_id = hostname;
-  RAY_LOG(INFO) << "Polling K8s lease... my_id=" << my_id;
-
-  bool exists = get_api(get_path, response);
-
-  absl::Time now = absl::Now();
-  if (response.contains("__api_server_date__")) {
-    std::string date_str = response["__api_server_date__"].get<std::string>();
-    std::string err;
-    absl::Time api_time;
-    if (absl::ParseTime("%a, %d %b %Y %H:%M:%S GMT", date_str, &api_time, &err)) {
-      now = api_time;
-      RAY_LOG(DEBUG) << "Using API server time: " << date_str;
-    } else {
-      RAY_LOG(WARNING) << "Failed to parse API server date: " << date_str << ", error: " << err;
-    }
-  }
-  std::string now_str =
-      absl::FormatTime("%Y-%m-%dT%H:%M:%E6SZ", now, absl::UTCTimeZone());
-
-  if (!exists) {
-    // Try to create it.
-    nlohmann::json create_req = {{"apiVersion", "coordination.k8s.io/v1"},
-                                 {"kind", "Lease"},
-                                 {"metadata",
-                                  {{"name", config_.gcs_leader_lease_name},
-                                   {"namespace", config_.gcs_leader_lease_namespace}}},
-                                 {"spec",
-                                  {{"holderIdentity", my_id},
-                                   {"leaseDurationSeconds", 10},
-                                   {"renewTime", now_str}}}};
-
-    std::string post_path = "/apis/coordination.k8s.io/v1/namespaces/" +
-                            config_.gcs_leader_lease_namespace + "/leases";
-    nlohmann::json create_resp;
-    if (post_api(post_path, create_req, create_resp)) {
-      RAY_LOG(INFO) << "Successfully created Lease and acquired leadership.";
-      return true;
-    } else {
-      RAY_LOG(WARNING)
-          << "Failed to create Lease. Might already exist or permission denied.";
-      return false;
-    }
-  }
-
-  // Lease exists, check if we hold it or if it is expired.
-  try {
-    std::string holder = "";
-    if (response.contains("spec") && response["spec"].contains("holderIdentity")) {
-      holder = response["spec"]["holderIdentity"].get<std::string>();
-    }
-
-    int duration = 15;
-    if (response.contains("spec") && response["spec"].contains("leaseDurationSeconds")) {
-      duration = response["spec"]["leaseDurationSeconds"].get<int>();
-    }
-
-    std::string renew_time_str = "";
-    if (response.contains("spec") && response["spec"].contains("renewTime")) {
-      renew_time_str = response["spec"]["renewTime"].get<std::string>();
-    }
-
-    bool is_mine = (holder == my_id);
-    bool is_expired = true;
-
-    if (!renew_time_str.empty()) {
-      absl::Time renew_time;
-      std::string err;
-      if (absl::ParseTime(absl::RFC3339_full, renew_time_str, &renew_time, &err)) {
-        is_expired = (now - renew_time) > absl::Seconds(duration);
-      } else {
-        RAY_LOG(WARNING) << "Failed to parse renewTime: " << renew_time_str
-                         << ", error: " << err;
-      }
-    }
-
-    if (is_mine || is_expired) {
-      // Try to update it.
-      nlohmann::json update_req = response;  // Start with current state
-      update_req["spec"]["holderIdentity"] = my_id;
-      update_req["spec"]["renewTime"] = now_str;
-      update_req["spec"]["leaseDurationSeconds"] = 10;
-
-      nlohmann::json update_resp;
-      if (put_api(get_path, update_req, update_resp)) {
-        RAY_LOG(INFO) << "Successfully updated Lease and "
-                      << (is_mine ? "renewed" : "acquired") << " leadership.";
-        return true;
-      } else {
-        RAY_LOG(WARNING) << "Failed to update Lease. Conflict or permission denied.";
-        return false;
-      }
-    }
-  } catch (const std::exception &e) {
-    RAY_LOG(ERROR) << "Failed to parse or update Lease: " << e.what();
-  }
-
-  return false;
-}
 void GcsServer::GetOrGenerateClusterId(
     Postable<void(ClusterID cluster_id)> continuation) {
   instrumented_io_context &io_context = continuation.io_context();
@@ -528,6 +437,10 @@ void GcsServer::Stop() {
     kv_manager_.reset();
 
     is_stopped_ = true;
+
+    if (lease_thread_ && lease_thread_->joinable()) {
+      lease_thread_->join();
+    }
 
     RAY_LOG(INFO) << "GCS server stopped.";
   }

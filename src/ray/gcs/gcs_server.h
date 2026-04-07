@@ -35,6 +35,7 @@
 #include "ray/gcs/pubsub_handler.h"
 #include "ray/gcs/runtime_env_handler.h"
 #include "ray/gcs/usage_stats_client.h"
+#include "ray/gcs/leader_election/leader_election_client_interface.h"
 #include "ray/observability/metric_interface.h"
 #include "ray/observability/ray_event_recorder.h"
 #include "ray/pubsub/gcs_publisher.h"
@@ -223,13 +224,7 @@ class GcsServer {
   StorageType GetStorageType() const;
 
  protected:
-  /// Poll the Kubernetes API for leadership status via Lease.
-  bool PollK8sLease(
-      std::function<bool(const std::string &, nlohmann::json &)> get_api,
-      std::function<bool(const std::string &, const nlohmann::json &, nlohmann::json &)>
-          post_api,
-      std::function<bool(const std::string &, const nlohmann::json &, nlohmann::json &)>
-          put_api) const;
+
 
  private:
 
@@ -238,6 +233,9 @@ class GcsServer {
 
   /// Deferred loading of GCS tables data after promoting.
   void DoStartLoadingDeferred();
+
+  /// Start the asynchronous background loop for leader election polling.
+  void StartLeaderElectionPolling();
 
   /// Print debug info periodically.
   void PrintDebugState() const;
@@ -337,6 +335,11 @@ class GcsServer {
   std::function<void(int)> port_ready_callback_;
   /// Client to call a metrics agent gRPC server.
   std::unique_ptr<rpc::MetricsAgentClient> metrics_agent_client_;
+
+  /// Generic client for distributed lock/lease management.
+  std::unique_ptr<LeaderLeaseClientInterface> lease_client_;
+  /// Background thread dedicated to synchronous HTTP lock polling.
+  std::unique_ptr<std::thread> lease_thread_;
 };
 
 }  // namespace gcs
