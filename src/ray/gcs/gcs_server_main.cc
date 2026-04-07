@@ -66,20 +66,30 @@ int main(int argc, char *argv[]) {
   // Fallback to environment variables if flags are not set or are default.
   if (FLAGS_gcs_polling_interval_ms == 500) {
     const char *env_interval = std::getenv("RAY_GCS_POLLING_INTERVAL_MS");
-    if (env_interval) {
+    if (env_interval != nullptr) {
       FLAGS_gcs_polling_interval_ms = std::stoi(env_interval);
     }
   }
   if (FLAGS_gcs_leader_lease_name.empty()) {
     const char *env_lease_name = std::getenv("RAY_GCS_LEADER_LEASE_NAME");
-    if (env_lease_name) {
+    if (env_lease_name != nullptr) {
       FLAGS_gcs_leader_lease_name = env_lease_name;
+    } else {
+      const char *env_cluster_name = std::getenv("RAY_CLUSTER_NAME");
+      if (env_cluster_name != nullptr) {
+        FLAGS_gcs_leader_lease_name = env_cluster_name;
+      }
     }
   }
   if (FLAGS_gcs_leader_lease_namespace.empty()) {
     const char *env_lease_ns = std::getenv("RAY_GCS_LEADER_LEASE_NAMESPACE");
-    if (env_lease_ns) {
+    if (env_lease_ns != nullptr) {
       FLAGS_gcs_leader_lease_namespace = env_lease_ns;
+    } else {
+      const char *env_cluster_ns = std::getenv("RAY_CLUSTER_NAMESPACE");
+      if (env_cluster_ns != nullptr) {
+        FLAGS_gcs_leader_lease_namespace = env_cluster_ns;
+      }
     }
   }
   if (!FLAGS_stdout_filepath.empty()) {

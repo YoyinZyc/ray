@@ -15,6 +15,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "absl/time/time.h"
 
 #include "gtest/gtest.h"
 #include "ray/common/asio/instrumented_io_context.h"
@@ -519,6 +520,122 @@ TEST_F(GcsServerTest, TestWorkerInfo) {
               worker_data->worker_address().worker_id());
 }
 // TODO(sang): Add tests after adding asyncAdd
+
+class TestGcsServer : public gcs::GcsServer {
+ public:
+  TestGcsServer(const gcs::GcsServerConfig &config,
+                gcs::GcsServerMetrics &metrics,
+                instrumented_io_context &io_context)
+      : GcsServer(config, metrics, io_context) {}
+
+  bool TestPollK8sLease(
+      std::function<bool(const std::string &, nlohmann::json &)> get_api,
+      std::function<bool(const std::string &, const nlohmann::json &, nlohmann::json &)> post_api,
+      std::function<bool(const std::string &, const nlohmann::json &, nlohmann::json &)> put_api) {
+    return PollK8sLease(get_api, post_api, put_api);
+  }
+};
+
+TEST_F(GcsServerTest, TestAcquireLeaseNotExist) {
+  gcs::GcsServerConfig config;
+  config.gcs_leader_lease_name = "test-lease";
+  config.gcs_leader_lease_namespace = "test-namespace";
+  setenv("HOSTNAME", "my-pod-id", 1);
+
+  TestGcsServer server(config, fake_metrics_, io_service_);
+
+  auto get_api = [](const std::string &path, nlohmann::json &response) -> bool {
+    return false; // Does not exist
+  };
+
+  bool post_called = false;
+  auto post_api = [&post_called](const std::string &path, const nlohmann::json &body, nlohmann::json &response) -> bool {
+    post_called = true;
+    EXPECT_EQ(body["spec"]["holderIdentity"], "my-pod-id");
+    response = body;
+    return true;
+  };
+
+  auto put_api = [](const std::string &path, const nlohmann::json &body, nlohmann::json &response) -> bool {
+    return false;
+  };
+
+  bool result = server.TestPollK8sLease(get_api, post_api, put_api);
+  EXPECT_TRUE(result);
+  EXPECT_TRUE(post_called);
+}
+
+TEST_F(GcsServerTest, TestRenewLeaseMine) {
+  gcs::GcsServerConfig config;
+  config.gcs_leader_lease_name = "test-lease";
+  config.gcs_leader_lease_namespace = "test-namespace";
+  setenv("HOSTNAME", "my-pod-id", 1);
+
+  TestGcsServer server(config, fake_metrics_, io_service_);
+
+  auto get_api = [](const std::string &path, nlohmann::json &response) -> bool {
+    response = {
+      {"metadata", {{"resourceVersion", "1"}}},
+      {"spec", {
+        {"holderIdentity", "my-pod-id"},
+        {"leaseDurationSeconds", 15},
+        {"renewTime", absl::FormatTime(absl::RFC3339_full, absl::Now() - absl::Seconds(10), absl::UTCTimeZone())}
+      }}
+    };
+    return true;
+  };
+
+  auto post_api = [](const std::string &path, const nlohmann::json &body, nlohmann::json &response) -> bool {
+    return false;
+  };
+
+  bool put_called = false;
+  auto put_api = [&put_called](const std::string &path, const nlohmann::json &body, nlohmann::json &response) -> bool {
+    put_called = true;
+    EXPECT_EQ(body["spec"]["holderIdentity"], "my-pod-id");
+    return true;
+  };
+
+  bool result = server.TestPollK8sLease(get_api, post_api, put_api);
+  EXPECT_TRUE(result);
+  EXPECT_TRUE(put_called);
+}
+
+TEST_F(GcsServerTest, TestAcquireLeaseExpired) {
+  gcs::GcsServerConfig config;
+  config.gcs_leader_lease_name = "test-lease";
+  config.gcs_leader_lease_namespace = "test-namespace";
+  setenv("HOSTNAME", "my-pod-id", 1);
+
+  TestGcsServer server(config, fake_metrics_, io_service_);
+
+  auto get_api = [](const std::string &path, nlohmann::json &response) -> bool {
+    response = {
+      {"metadata", {{"resourceVersion", "1"}}},
+      {"spec", {
+        {"holderIdentity", "other-pod-id"},
+        {"leaseDurationSeconds", 15},
+        {"renewTime", absl::FormatTime(absl::RFC3339_full, absl::Now() - absl::Seconds(20), absl::UTCTimeZone())}
+      }}
+    };
+    return true;
+  };
+
+  auto post_api = [](const std::string &path, const nlohmann::json &body, nlohmann::json &response) -> bool {
+    return false;
+  };
+
+  bool put_called = false;
+  auto put_api = [&put_called](const std::string &path, const nlohmann::json &body, nlohmann::json &response) -> bool {
+    put_called = true;
+    EXPECT_EQ(body["spec"]["holderIdentity"], "my-pod-id");
+    return true;
+  };
+
+  bool result = server.TestPollK8sLease(get_api, post_api, put_api);
+  EXPECT_TRUE(result);
+  EXPECT_TRUE(put_called);
+}
 
 }  // namespace ray
 

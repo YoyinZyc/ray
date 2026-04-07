@@ -198,6 +198,76 @@ bool K8sApiGet(const std::string &path,
 
     response_json = nlohmann::json::parse(res.body());
 
+    auto date_hdr = res[http::field::date];
+    if (!date_hdr.empty()) {
+      response_json["__api_server_date__"] = std::string(date_hdr);
+    }
+
+    beast::error_code ec;
+    stream.shutdown(ec);
+    if (ec == net::error::eof) {
+      ec.assign(0, ec.category());
+    }
+    if (ec) {
+      RAY_LOG(WARNING) << "SSL stream shutdown failed: " << ec.message();
+    }
+  } catch (const std::exception &e) {
+    RAY_LOG(ERROR) << "Kubernetes API request failed: " << e.what();
+    return false;
+  }
+
+  return true;
+}
+
+bool K8sApiPut(const std::string &path,
+               const nlohmann::json &body,
+               nlohmann::json &response_json) {
+  static std::string k8s_sa_token = ReadFile(kK8sSaTokenPath);
+
+  try {
+    net::io_context ioc;
+    ssl::context ctx(ssl::context::tlsv12_client);
+
+    ctx.load_verify_file(kK8sCaCertPath);
+    ctx.set_verify_mode(ssl::verify_peer);
+
+    tcp::resolver resolver(ioc);
+    ssl::stream<beast::tcp_stream> stream(ioc, ctx);
+
+    if (!SSL_set_tlsext_host_name(stream.native_handle(), k8s_host)) {
+      beast::error_code ec{static_cast<int>(::ERR_get_error()),
+                           net::error::get_ssl_category()};
+      RAY_LOG(ERROR) << "Failed to set SNI hostname: " << ec.message();
+      return false;
+    }
+
+    auto const results = resolver.resolve(k8s_host, k8s_port);
+    beast::get_lowest_layer(stream).connect(results);
+    stream.handshake(ssl::stream_base::client);
+
+    http::request<http::string_body> req{http::verb::put, path, 11};
+    req.set(http::field::host, k8s_host);
+    req.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
+    req.set(http::field::content_type, "application/json");
+    std::string auth_header = "Bearer " + k8s_sa_token;
+    req.set(http::field::authorization, auth_header);
+    req.body() = body.dump();
+    req.prepare_payload();
+
+    http::write(stream, req);
+
+    beast::flat_buffer buffer;
+    http::response<http::string_body> res;
+    http::read(stream, buffer, res);
+
+    if (res.result() != http::status::ok && res.result() != http::status::created) {
+      RAY_LOG(WARNING) << "Kubernetes API request returned HTTP status "
+                       << res.result_int() << ". Response: " << res.body();
+      return false;
+    }
+
+    response_json = nlohmann::json::parse(res.body());
+
     beast::error_code ec;
     stream.shutdown(ec);
     if (ec == net::error::eof) {

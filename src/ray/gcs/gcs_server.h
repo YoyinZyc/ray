@@ -222,8 +222,23 @@ class GcsServer {
   /// Gets the type of KV storage to use from config.
   StorageType GetStorageType() const;
 
+ protected:
   /// Poll the Kubernetes API for leadership status via Lease.
-  bool PollK8sLease() const;
+  bool PollK8sLease(
+      std::function<bool(const std::string &, nlohmann::json &)> get_api,
+      std::function<bool(const std::string &, const nlohmann::json &, nlohmann::json &)>
+          post_api,
+      std::function<bool(const std::string &, const nlohmann::json &, nlohmann::json &)>
+          put_api) const;
+
+ private:
+
+  /// Load GCS tables data asynchronously.
+  void DoStartLoading();
+
+  /// Deferred loading of GCS tables data after promoting.
+  void DoStartLoadingDeferred();
+
   /// Print debug info periodically.
   void PrintDebugState() const;
 

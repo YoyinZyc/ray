@@ -1,0 +1,72 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: ray-self-contained-gcs
+  namespace: default
+spec:
+  gcsFaultToleranceOptions:
+    redisAddress: redis-shadow:6379
+  headGroupSpec:
+    enableShadowHead: true
+    rayStartParams:
+      dashboard-host: 0.0.0.0
+    template:
+      metadata:
+        labels:
+          ray.io/cluster: ray-self-contained-gcs
+      spec:
+        containers:
+        - name: ray-head
+          image: us-central1-docker.pkg.dev/yczhou-gke-dev/shadow-head-repo/ray-shadow-gcs:custom
+          imagePullPolicy: Always
+          env:
+          - name: RAY_health_check_failure_threshold
+            value: "10"
+          - name: RAY_health_check_period_ms
+            value: "5000"
+          ports:
+          - containerPort: 6379
+            name: gcs
+            protocol: TCP
+          - containerPort: 8265
+            name: dashboard
+            protocol: TCP
+          - containerPort: 10001
+            name: client
+            protocol: TCP
+          readinessProbe:
+            exec:
+              command:
+              - /bin/bash
+              - -c
+              - |
+                TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+                NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)
+                WGET_OUTPUT=$(wget -qO- --header "Authorization: Bearer $TOKEN" --no-check-certificate https://kubernetes.default.svc/apis/coordination.k8s.io/v1/namespaces/$NAMESPACE/leases/$RAY_CLUSTER_NAME)
+                echo $WGET_OUTPUT | grep -q "\"holderIdentity\": *\"$(hostname)\""
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources: {}
+        serviceAccountName: ray-shadow-head-sa
+  rayVersion: 2.54.0
+  workerGroupSpecs:
+  - groupName: worker-group
+    maxReplicas: 3
+    minReplicas: 1
+    numOfHosts: 1
+    rayStartParams: {}
+    replicas: 1
+    template:
+      metadata: {}
+      spec:
+        containers:
+        - name: ray-worker
+          image: rayproject/ray:2.54.0
+          env:
+          - name: RAY_gcs_rpc_server_reconnect_timeout_s
+            value: "600"
+          ports:
+          - containerPort: 10002
+            name: client
+            protocol: TCP
+          resources: {}
