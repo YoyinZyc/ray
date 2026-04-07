@@ -1,0 +1,32 @@
+# Bazel build file for the generic distributed leader election library.
+
+load("//bazel:ray.bzl", "ray_cc_library", "ray_cc_test")
+
+ray_cc_library(
+    name = "leader_election",
+    srcs = [
+        "k8s_lease_client.cc",
+    ],
+    hdrs = [
+        "k8s_lease_client.h",
+        "leader_election_client_interface.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/ray/util:logging",
+        "@com_google_absl//absl/time",
+        "@nlohmann_json",
+    ],
+)
+
+ray_cc_test(
+    name = "k8s_lease_client_test",
+    srcs = [
+        "k8s_lease_client_test.cc",
+    ],
+    tags = ["small"],
+    deps = [
+        ":leader_election",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
