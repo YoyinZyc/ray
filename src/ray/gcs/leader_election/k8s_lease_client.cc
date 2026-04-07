@@ -20,6 +20,10 @@
 namespace ray {
 namespace gcs {
 
+namespace {
+constexpr int kDefaultLeaseDurationSeconds = 10;
+}  // namespace
+
 K8sLeaseClient::K8sLeaseClient(
     std::string lease_namespace,
     std::function<bool(const std::string &, nlohmann::json &)> get_api,
@@ -77,7 +81,8 @@ bool K8sLeaseClient::TryAcquire(const std::string &lease_key,
     current_holder = response["spec"]["holderIdentity"].get<std::string>();
   }
 
-  int current_duration = 10;
+  const int kDefaultLeaseDurationSeconds = 10;
+  int current_duration = kDefaultLeaseDurationSeconds;
   if (response.contains("spec") && response["spec"].contains("leaseDurationSeconds")) {
     current_duration = response["spec"]["leaseDurationSeconds"].get<int>();
   }
