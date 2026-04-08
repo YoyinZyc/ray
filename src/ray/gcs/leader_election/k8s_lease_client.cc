@@ -21,7 +21,19 @@ namespace ray {
 namespace gcs {
 
 namespace {
-constexpr int kDefaultLeaseDurationSeconds = 10;
+int GetLeaseDurationSeconds() {
+  if (const char *env_ttl = std::getenv("RAY_GCS_LEADER_LEASE_TTL_S")) {
+    try {
+      int val = std::stoi(env_ttl);
+      if (val > 0) {
+        return val;
+      }
+    } catch (...) {
+      // Fallback to default
+    }
+  }
+  return 10;
+}
 }  // namespace
 
 K8sLeaseClient::K8sLeaseClient(
@@ -48,12 +60,12 @@ bool K8sLeaseClient::TryAcquire(const std::string &lease_key,
   if (exists && response.contains("__api_server_date__")) {
     std::string date_str = response["__api_server_date__"].get<std::string>();
     std::string err;
-    if (!absl::ParseTime(absl::RFC1123_full, date_str, &now, &err)) {
+    if (!absl::ParseTime("%a, %d %b %Y %H:%M:%S %Z", date_str, &now, &err)) {
       RAY_LOG(WARNING) << "Failed to parse API server date: " << date_str << ", error: " << err;
     }
   }
   std::string now_str = absl::FormatTime("%Y-%m-%dT%H:%M:%E6SZ", now, absl::UTCTimeZone());
-  int ttl_seconds = ttl_ms / 1000;
+  int ttl_seconds = GetLeaseDurationSeconds();
 
   if (!exists) {
     nlohmann::json create_req = {{"apiVersion", "coordination.k8s.io/v1"},
@@ -81,8 +93,7 @@ bool K8sLeaseClient::TryAcquire(const std::string &lease_key,
     current_holder = response["spec"]["holderIdentity"].get<std::string>();
   }
 
-  const int kDefaultLeaseDurationSeconds = 10;
-  int current_duration = kDefaultLeaseDurationSeconds;
+  int current_duration = GetLeaseDurationSeconds();
   if (response.contains("spec") && response["spec"].contains("leaseDurationSeconds")) {
     current_duration = response["spec"]["leaseDurationSeconds"].get<int>();
   }

@@ -17,9 +17,11 @@ spec:
       spec:
         containers:
         - name: ray-head
-          image: us-central1-docker.pkg.dev/yczhou-gke-dev/shadow-head-repo/ray-shadow-gcs:custom
+          image: us-central1-docker.pkg.dev/yczhou-gke-dev/shadow-head-repo/ray-shadow-gcs:phase3-ttl
           imagePullPolicy: Always
           env:
+          - name: RAY_GCS_LEADER_LEASE_TTL_S
+            value: "3"
           - name: RAY_health_check_failure_threshold
             value: "10"
           - name: RAY_health_check_period_ms
