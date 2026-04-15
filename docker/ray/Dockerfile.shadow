@@ -1,0 +1,36 @@
+# Stage 1: Build
+FROM us-central1-docker.pkg.dev/yczhou-gke-dev/shadow-head-repo/ray-shadow-gcs:final-test as builder
+
+USER root
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    git \
+    python3-pip \
+    openjdk-11-jdk
+
+# Install Bazelisk
+RUN curl -L https://github.com/bazelbuild/bazelisk/releases/download/v1.19.0/bazelisk-linux-amd64 -o /usr/local/bin/bazel && \
+    chmod +x /usr/local/bin/bazel
+
+# Copy source code
+COPY . /workspace
+WORKDIR /workspace
+
+# Build gcs_server
+# We use --flock=false to avoid issues with locking in container if any
+RUN bazel build //src/ray/gcs:gcs_server
+
+# Stage 2: Replace
+FROM us-central1-docker.pkg.dev/yczhou-gke-dev/shadow-head-repo/ray-shadow-gcs:final-test
+
+USER root
+COPY --from=builder /workspace/bazel-bin/src/ray/gcs/gcs_server /tmp/gcs_server
+RUN GCS_PATH=$(python -c "import ray; import os; print(os.path.dirname(ray.__file__) + '/core/src/ray/gcs/gcs_server')") && \
+    cp /tmp/gcs_server $GCS_PATH && \
+    chmod +x $GCS_PATH && \
+    chown ray:users $GCS_PATH
+
+USER ray
