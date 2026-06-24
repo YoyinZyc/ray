@@ -1245,6 +1245,8 @@ def start_api_server(
     stdout_filepath: Optional[str] = None,
     stderr_filepath: Optional[str] = None,
     proxy_server_url: Optional[str] = None,
+    # Environment variables to pass to the process.
+    env_updates: Optional[dict] = None,
 ):
     """Start a API server process.
 
@@ -1395,31 +1397,63 @@ def start_api_server(
             stdout_file=stdout_file,
             stderr_file=stderr_file,
             fate_share=fate_share,
+            env_updates=env_updates,
         )
 
         # Retrieve the dashboard url
         gcs_client = GcsClient(address=gcs_address, cluster_id=cluster_id_hex)
         ray.experimental.internal_kv._initialize_internal_kv(gcs_client)
+
+        is_leader_elect_enabled = ray_constants.RAY_LEADER_ELECT
+        if env_updates and ray_constants.RAY_LEADER_ELECT_ENV_VAR in env_updates:
+            is_leader_elect_enabled = str(
+                env_updates[ray_constants.RAY_LEADER_ELECT_ENV_VAR]
+            ).lower() in ("true", "1")
+
+        if is_leader_elect_enabled:
+            is_passive = not gcs_client.is_gcs_leader()
+        else:
+            is_passive = False
+
         dashboard_url = None
         dashboard_returncode = None
         start_time_s = time.time()
         while (
             time.time() - start_time_s < ray_constants.RAY_DASHBOARD_STARTUP_TIMEOUT_S
         ):
-            dashboard_url = ray.experimental.internal_kv._internal_kv_get(
-                ray_constants.DASHBOARD_ADDRESS,
-                namespace=ray_constants.KV_NAMESPACE_DASHBOARD,
-            )
-            if dashboard_url is not None:
-                dashboard_url = dashboard_url.decode("utf-8")
-                break
-            dashboard_returncode = process_info.process.poll()
-            if dashboard_returncode is not None:
-                break
+            if is_passive:
+                # In passive mode, GCS blocks writing to internal_kv (returns Status::GcsPassive).
+                # The spawned dashboard process is running its HTTP server locally and retrying
+                # registration in a background loop until GCS leadership promotion.
+                # Therefore, we skip polling internal_kv and simply verify the process stays alive.
+                dashboard_returncode = process_info.process.poll()
+                if dashboard_returncode is not None:
+                    break
+                if time.time() - start_time_s >= 2.0:
+                    logger.info(
+                        "Dashboard started in passive mode (process remains alive)."
+                    )
+                    break
+            else:
+                dashboard_url = ray.experimental.internal_kv._internal_kv_get(
+                    ray_constants.DASHBOARD_ADDRESS,
+                    namespace=ray_constants.KV_NAMESPACE_DASHBOARD,
+                )
+                if dashboard_url is not None:
+                    dashboard_url = dashboard_url.decode("utf-8")
+                    break
+                dashboard_returncode = process_info.process.poll()
+                if dashboard_returncode is not None:
+                    break
 
             # This is often on the critical path of ray.init() and ray start,
             # so we need to poll often.
             time.sleep(0.1)
+
+        # In passive mode, dashboard_url cannot be retrieved from KV at startup.
+        # Default to empty string so ray.init() completes without error.
+        if dashboard_url is None and is_passive:
+            dashboard_url = ""
 
         # Dashboard couldn't be started.
         if dashboard_url is None:
@@ -1535,6 +1569,8 @@ def start_gcs_server(
     node_ip_address: Optional[str] = None,
     session_dir: Optional[str] = None,
     node_id: Optional[str] = None,
+    # Environment variables to pass to the GCS server process.
+    env_updates: Optional[dict] = None,
 ):
     """Start a gcs server.
 
@@ -1557,6 +1593,7 @@ def start_gcs_server(
         node_ip_address: IP Address of a node where gcs server starts.
         session_dir: Session directory path. Used to write the bound GCS port to a file.
         node_id: The unique ID of this node.
+        env_updates: Environment variables to pass to the GCS server process.
 
     Returns:
         ProcessInfo for the process that was started.
@@ -1603,6 +1640,7 @@ def start_gcs_server(
         stdout_file=stdout_file,
         stderr_file=stderr_file,
         fate_share=fate_share,
+        env_updates=env_updates,
     )
     return process_info
 
