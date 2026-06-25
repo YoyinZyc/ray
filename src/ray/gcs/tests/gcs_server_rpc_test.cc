@@ -80,25 +80,24 @@ class GcsServerTest : public ::testing::Test {
     config.redis_port = TEST_REDIS_SERVER_PORTS.front();
 
     gcs_server_ = std::make_unique<gcs::GcsServer>(config, fake_metrics_, io_service_);
+    std::promise<int> port_promise;
+    gcs_server_->SetPortReadyCallback(
+        [&port_promise](int port) { port_promise.set_value(port); });
     gcs_server_->Start();
 
     StartMainIOServiceThread();
 
     // Wait until server starts listening.
-    while (gcs_server_->GetPort() == 0) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
+    int port = port_promise.get_future().get();
 
     // Create gcs rpc client
     client_call_manager_.reset(new rpc::ClientCallManager(
         io_service_, /*record_stats=*/false, /*local_address=*/""));
-    client_.reset(
-        new rpc::GcsRpcClient("0.0.0.0", gcs_server_->GetPort(), *client_call_manager_));
+    client_.reset(new rpc::GcsRpcClient("0.0.0.0", port, *client_call_manager_));
 
     // Create health check stub.
-    auto channel =
-        grpc::CreateChannel("localhost:" + std::to_string(gcs_server_->GetPort()),
-                            grpc::InsecureChannelCredentials());
+    auto channel = grpc::CreateChannel("localhost:" + std::to_string(port),
+                                       grpc::InsecureChannelCredentials());
     health_check_stub_ = grpc::health::v1::Health::NewStub(channel);
   }
 
@@ -622,17 +621,17 @@ TEST_F(GcsServerTest, TestPassiveServerReadiness) {
 
   auto passive_server =
       std::make_unique<gcs::GcsServer>(passive_config, fake_metrics_, io_service_);
+  std::promise<int> port_promise;
+  passive_server->SetPortReadyCallback(
+      [&port_promise](int port) { port_promise.set_value(port); });
   passive_server->Start();
 
   // Wait until server starts listening.
-  while (passive_server->GetPort() == 0) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
+  int port = port_promise.get_future().get();
 
   // Create health check stub pointing to the passive GCS server.
-  auto channel =
-      grpc::CreateChannel("localhost:" + std::to_string(passive_server->GetPort()),
-                          grpc::InsecureChannelCredentials());
+  auto channel = grpc::CreateChannel("localhost:" + std::to_string(port),
+                                     grpc::InsecureChannelCredentials());
   auto passive_health_check_stub = grpc::health::v1::Health::NewStub(channel);
 
   // Check health of the passive server.
@@ -668,21 +667,21 @@ TEST_F(GcsServerTest, TestPassivePromotion) {
 
   auto passive_server =
       std::make_unique<GcsServerTestFixture>(passive_config, fake_metrics_, io_service_);
+  std::promise<int> port_promise;
+  passive_server->SetPortReadyCallback(
+      [&port_promise](int port) { port_promise.set_value(port); });
   passive_server->Start();
 
   // Wait until server starts listening.
-  while (passive_server->GetPort() == 0) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
+  int port = port_promise.get_future().get();
 
   // Create client pointing to the passive GCS server.
-  auto passive_client = std::make_unique<rpc::GcsRpcClient>(
-      "0.0.0.0", passive_server->GetPort(), *client_call_manager_);
+  auto passive_client =
+      std::make_unique<rpc::GcsRpcClient>("0.0.0.0", port, *client_call_manager_);
 
   // Verify it is responsive to healthcheck.
-  auto channel =
-      grpc::CreateChannel("localhost:" + std::to_string(passive_server->GetPort()),
-                          grpc::InsecureChannelCredentials());
+  auto channel = grpc::CreateChannel("localhost:" + std::to_string(port),
+                                     grpc::InsecureChannelCredentials());
   auto passive_health_check_stub = grpc::health::v1::Health::NewStub(channel);
   grpc::health::v1::HealthCheckRequest request;
   grpc::health::v1::HealthCheckResponse response;
@@ -799,16 +798,17 @@ TEST_F(GcsServerTest, TestPassiveHeadNodeRegistrationAndPromotion) {
 
   auto passive_server =
       std::make_unique<GcsServerTestFixture>(passive_config, fake_metrics_, io_service_);
+  std::promise<int> port_promise;
+  passive_server->SetPortReadyCallback(
+      [&port_promise](int port) { port_promise.set_value(port); });
   passive_server->Start();
 
   // Wait until server starts listening.
-  while (passive_server->GetPort() == 0) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
+  int port = port_promise.get_future().get();
 
   // Create client pointing to passive GCS server.
-  auto passive_client = std::make_unique<rpc::GcsRpcClient>(
-      "0.0.0.0", passive_server->GetPort(), *client_call_manager_);
+  auto passive_client =
+      std::make_unique<rpc::GcsRpcClient>("0.0.0.0", port, *client_call_manager_);
 
   // 2. Register new head node B (ALIVE) on passive GCS server.
   // It must bypass passive gating and return Status::OK!
