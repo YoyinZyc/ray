@@ -55,6 +55,9 @@ class ClientCallManager;
 
 namespace gcs {
 
+class LeaderElector;
+class LeaderLeaseClientInterface;
+
 struct GcsServerConfig {
   std::string grpc_server_name = "GcsServer";
   uint16_t grpc_server_port = 0;
@@ -76,6 +79,13 @@ struct GcsServerConfig {
   // Whether GCS active-passive leader election is enabled. If true, GCS server boots
   // in passive mode and waits for leadership promotion.
   bool ray_leader_elect_enabled = false;
+  std::string gcs_leader_lease_namespace = "ray-system";
+  std::string gcs_leader_lease_name = "gcs-leader-lease";
+  int ray_leader_elect_lease_duration_seconds = 15;
+  int ray_leader_elect_renew_deadline_seconds = 10;
+  int ray_leader_elect_retry_period_seconds = 2;
+  // A test helper to inject a mocked client.
+  std::shared_ptr<LeaderLeaseClientInterface> mock_lease_client = nullptr;
 };
 
 class GcsNodeManager;
@@ -392,6 +402,8 @@ class GcsServer {
   /// Declared last so it is stopped/destroyed before the io_contexts
   /// (owned by io_context_provider_) and metrics it references.
   std::unique_ptr<IOContextMonitorThread> io_context_monitor_thread_;
+  /// Leader elector background coordinator.
+  std::unique_ptr<LeaderElector> elector_;
 };
 
 }  // namespace gcs

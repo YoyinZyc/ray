@@ -1120,6 +1120,21 @@ RAY_CONFIG(bool, enable_core_worker_task_event_to_gcs, true)
 // leader election in sync.
 RAY_CONFIG(bool, LEADER_ELECT, false)
 
+// Namespace of GCS leader election lease resource.
+RAY_CONFIG(std::string, leader_elect_resource_namespace, "ray-system")
+
+// Name of GCS leader election lease resource.
+RAY_CONFIG(std::string, leader_elect_resource_name, "gcs-leader-lease")
+
+// Lease duration for GCS leader election (in seconds).
+RAY_CONFIG(int32_t, leader_elect_lease_duration_seconds, 15)
+
+// Renew deadline for GCS leader election (in seconds).
+RAY_CONFIG(int32_t, leader_elect_renew_deadline_seconds, 10)
+
+// Retry period for GCS leader election (in seconds).
+RAY_CONFIG(int32_t, leader_elect_retry_period_seconds, 2)
+
 // Whether to enable the ray event to send to the event aggregator.
 // Currently, only task events are supported.
 // TODO(myan): #54515 Remove this flag after the task events are fully migrated to the
