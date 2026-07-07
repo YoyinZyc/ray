@@ -44,6 +44,21 @@ ray_cc_test(
     ],
 )
 
+# Shared helpers for GcsServer tests (fake metrics holder, dedicated server runner,
+# mock lease client). Kept in a header-only library so both the RPC test and the
+# isolated death test can reuse them without duplication.
+ray_cc_library(
+    name = "gcs_server_test_helpers",
+    hdrs = [
+        "gcs_server_test_helpers.h",
+    ],
+    deps = [
+        "//src/ray/gcs:gcs_server_lib",
+        "//src/ray/gcs/leader_election",
+        "//src/ray/observability:fake_metric",
+    ],
+)
+
 ray_cc_test(
     name = "gcs_server_rpc_test",
     size = "small",
@@ -65,8 +80,74 @@ ray_cc_test(
     ],
     visibility = ["//visibility:private"],
     deps = [
+        ":gcs_server_test_helpers",
         "//src/ray/common:test_utils",
         "//src/ray/gcs:gcs_server_lib",
+        "//src/ray/gcs/leader_election",
+        "//src/ray/observability:fake_metric",
+        "@com_github_grpc_grpc//src/proto/grpc/health/v1:health_proto",
+    ],
+)
+
+# GCS leader election tests.
+ray_cc_test(
+    name = "gcs_server_leader_election_test",
+    size = "small",
+    srcs = [
+        "gcs_server_leader_election_test.cc",
+    ],
+    data = [
+        "//:redis-cli",
+        "//:redis-server",
+    ],
+    env = {
+        "TEST_REDIS_SERVER_EXEC_PATH": "$(rootpath //:redis-server)",
+        "TEST_REDIS_CLIENT_EXEC_PATH": "$(rootpath //:redis-cli)",
+    },
+    tags = [
+        "no_tsan",
+        "no_windows",
+        "team:core",
+    ],
+    visibility = ["//visibility:private"],
+    deps = [
+        ":gcs_server_test_helpers",
+        "//src/ray/common:test_utils",
+        "//src/ray/gcs:gcs_server_lib",
+        "//src/ray/gcs/leader_election",
+        "//src/ray/observability:fake_metric",
+        "@com_github_grpc_grpc//src/proto/grpc/health/v1:health_proto",
+    ],
+)
+
+# The step-down death test is in its own binary. gtest death tests fork(), which is
+# unsafe in a heavily-threaded, multi-test process; isolating it keeps the fork
+# thread-light and deterministic.
+ray_cc_test(
+    name = "gcs_server_leader_election_death_test",
+    size = "small",
+    srcs = [
+        "gcs_server_leader_election_death_test.cc",
+    ],
+    data = [
+        "//:redis-cli",
+        "//:redis-server",
+    ],
+    env = {
+        "TEST_REDIS_SERVER_EXEC_PATH": "$(rootpath //:redis-server)",
+        "TEST_REDIS_CLIENT_EXEC_PATH": "$(rootpath //:redis-cli)",
+    },
+    tags = [
+        "no_tsan",
+        "no_windows",
+        "team:core",
+    ],
+    visibility = ["//visibility:private"],
+    deps = [
+        ":gcs_server_test_helpers",
+        "//src/ray/common:test_utils",
+        "//src/ray/gcs:gcs_server_lib",
+        "//src/ray/gcs/leader_election",
         "//src/ray/observability:fake_metric",
         "@com_github_grpc_grpc//src/proto/grpc/health/v1:health_proto",
     ],

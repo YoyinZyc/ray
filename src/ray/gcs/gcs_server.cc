@@ -273,10 +273,16 @@ std::unique_ptr<LeaderElector> GcsServer::BuildLeaderElector() {
   // believe they hold the lease (split-brain). Prefer the GCS NodeID (random per
   // incarnation). Fall back to hostname:pid when the NodeID is unset (e.g. in tests or
   // local multi-process runs on the same host).
-  election_config.holder_id =
-      gcs_node_id_.IsNil()
-          ? (boost::asio::ip::host_name() + ":" + std::to_string(getpid()))
-          : gcs_node_id_.Hex();
+  std::string hostname = "unknown-host";
+  try {
+    hostname = boost::asio::ip::host_name();
+  } catch (const boost::system::system_error &ex) {
+    RAY_LOG(WARNING) << "Failed to determine hostname: " << ex.what()
+                     << ", falling back to '" << hostname << "'.";
+  }
+  election_config.holder_id = gcs_node_id_.IsNil()
+                                  ? (hostname + ":" + std::to_string(getpid()))
+                                  : gcs_node_id_.Hex();
   election_config.lease_duration_seconds =
       config_.ray_leader_elect_lease_duration_seconds;
   election_config.renew_deadline_seconds =
@@ -369,7 +375,14 @@ void GcsServer::GetOrGenerateClusterId(
          }
 
          // 2. Cluster ID not found, and GCS is running in standby (passive) mode.
-         if (config_.ray_leader_elect_enabled && !IsLeader()) {
+         // Use the elector's leadership (not is_leader_, which only flips after the
+         // deferred table load) to decide: while this node has NOT won the lease, wait
+         // for the active leader to write the cluster ID. Once this node's elector has
+         // acquired leadership, fall through to generate and persist it ourselves --
+         // otherwise cold start would deadlock (DoStart waits for the ID, promotion waits
+         // for DoStart).
+         const bool elector_is_leader = elector_ != nullptr && elector_->IsLeader();
+         if (config_.ray_leader_elect_enabled && !elector_is_leader) {
            RAY_LOG(INFO) << "Cluster ID not found in storage. Waiting for active GCS "
                             "leader to write it...";
            auto &io_ctx = continuation.io_context();
@@ -476,6 +489,11 @@ void GcsServer::DoStartLoadingDeferred() {
   // Must run on the main io_context (see the on_started_leading callback, which
   // dispatches here). The leader election callback may fire more than once, so guard
   // against re-entrancy to ensure promotion happens at most once.
+  if (is_stopped_.load()) {
+    // The server is shutting down. Do not promote or reschedule, otherwise the retry
+    // timer below would keep firing on the io_context during teardown.
+    return;
+  }
   if (!is_started_.load()) {
     // The base server bring-up (DoStart) has not finished yet. It is a rare condition.
     // Retry shortly so we do not consume the idempotency guard before we can actually

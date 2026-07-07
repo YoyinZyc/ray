@@ -46,6 +46,7 @@ void GrpcServer::Init() {
 
 void GrpcServer::Shutdown() {
   if (!is_shutdown_) {
+    is_shutdown_ = true;
     // Drain the executor threads.
     // Shutdown the server with an immediate deadline.
     // TODO(edoakes): do we want to do this in all cases?
@@ -56,7 +57,6 @@ void GrpcServer::Shutdown() {
     for (auto &polling_thread : polling_threads_) {
       polling_thread.join();
     }
-    is_shutdown_ = true;
     RAY_LOG(DEBUG) << "gRPC server of " << name_ << " shutdown.";
     server_.reset();
   }
@@ -250,7 +250,8 @@ void GrpcServer::PollEventsFromCompletionQueue(int index) {
       delete_call = true;
     }
     if (delete_call) {
-      if (need_new_call && server_call->GetServerCallFactory().GetMaxActiveRPCs() != -1) {
+      if (!is_shutdown_ && need_new_call &&
+          server_call->GetServerCallFactory().GetMaxActiveRPCs() != -1) {
         // Create a new `ServerCall` to accept the next incoming request.
         server_call->GetServerCallFactory().CreateCall();
       }
