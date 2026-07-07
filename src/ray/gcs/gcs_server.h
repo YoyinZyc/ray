@@ -202,6 +202,11 @@ class GcsServer {
 
   void DoStartLoadingDeferred();
 
+  /// Build and return the leader elector used to run active-passive GCS leader
+  /// election. Uses the injected mock lease client if provided (for tests),
+  /// otherwise creates a real lease client via the factory.
+  std::unique_ptr<LeaderElector> BuildLeaderElector();
+
   /// Initialize gcs node manager.
   void InitGcsNodeManager(const GcsInitData &gcs_init_data);
 
@@ -391,6 +396,9 @@ class GcsServer {
   std::atomic<bool> is_stopped_;
   /// Flag to track GCS leadership status.
   std::atomic<bool> is_leader_;
+  /// Ensures the deferred promotion load (DoStartLoadingDeferred) runs at most once,
+  /// even if the leader election callback fires more than once.
+  std::atomic<bool> promotion_started_ = false;
   /// Flag to ensure InitMetricsExporter is only called once.
   std::atomic<bool> metrics_exporter_initialized_ = false;
   // Invoked when the RPC server has bound to a port.

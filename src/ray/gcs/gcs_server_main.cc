@@ -180,6 +180,16 @@ int main(int argc, char *argv[]) {
 
   if (RayConfig::instance().LEADER_ELECT()) {
     gcs_server_config.ray_leader_elect_enabled = true;
+    gcs_server_config.gcs_leader_lease_namespace =
+        RayConfig::instance().leader_elect_resource_namespace();
+    gcs_server_config.gcs_leader_lease_name =
+        RayConfig::instance().leader_elect_resource_name();
+    gcs_server_config.ray_leader_elect_lease_duration_seconds =
+        RayConfig::instance().leader_elect_lease_duration_seconds();
+    gcs_server_config.ray_leader_elect_renew_deadline_seconds =
+        RayConfig::instance().leader_elect_renew_deadline_seconds();
+    gcs_server_config.ray_leader_elect_retry_period_seconds =
+        RayConfig::instance().leader_elect_retry_period_seconds();
   }
 
   // Create individual metrics

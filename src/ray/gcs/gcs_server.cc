@@ -14,6 +14,7 @@
 
 #include "ray/gcs/gcs_server.h"
 
+#include <boost/asio/ip/host_name.hpp>
 #include <memory>
 #include <string>
 #include <utility>
@@ -32,6 +33,8 @@
 #include "ray/gcs/gcs_resource_manager.h"
 #include "ray/gcs/gcs_worker_manager.h"
 #include "ray/gcs/grpc_services.h"
+#include "ray/gcs/leader_election/leader_election_client_factory.h"
+#include "ray/gcs/leader_election/leader_elector.h"
 #include "ray/gcs/store_client/in_memory_store_client.h"
 #include "ray/gcs/store_client/observable_store_client.h"
 #include "ray/gcs/store_client/redis_store_client.h"
@@ -257,12 +260,56 @@ GcsServer::GcsServer(const ray::gcs::GcsServerConfig &config,
 
 GcsServer::~GcsServer() { Stop(); }
 
+std::unique_ptr<LeaderElector> GcsServer::BuildLeaderElector() {
+  LeaderElectionConfig election_config;
+  if (config_.mock_lease_client) {
+    election_config.lease_client = config_.mock_lease_client;
+  } else {
+    election_config.lease_client = LeaderLeaseClientFactory::Create(
+        config_.gcs_leader_lease_namespace, config_.gcs_leader_lease_name);
+  }
+  // The holder ID identifies this GCS incarnation in the lease. It must be globally
+  // unique across all candidates; otherwise two heads sharing an identity could both
+  // believe they hold the lease (split-brain). Prefer the GCS NodeID (random per
+  // incarnation). Fall back to hostname:pid when the NodeID is unset (e.g. in tests or
+  // local multi-process runs on the same host).
+  election_config.holder_id =
+      gcs_node_id_.IsNil()
+          ? (boost::asio::ip::host_name() + ":" + std::to_string(getpid()))
+          : gcs_node_id_.Hex();
+  election_config.lease_duration_seconds =
+      config_.ray_leader_elect_lease_duration_seconds;
+  election_config.renew_deadline_seconds =
+      config_.ray_leader_elect_renew_deadline_seconds;
+  election_config.retry_period_seconds = config_.ray_leader_elect_retry_period_seconds;
+
+  election_config.on_started_leading = [this]() {
+    // This callback runs on the elector's background thread. Promotion touches GCS
+    // managers and the periodical runner, which are pinned to the main io_context via
+    // thread checkers, so dispatch the work onto the main io_context instead of running
+    // it here. is_leader_ is flipped to true inside DoStartLoadingDeferred only after the
+    // tables have finished loading, so the GCS never advertises leadership with empty
+    // state.
+    io_context_provider_.GetDefaultIOContext().post(
+        [this]() { DoStartLoadingDeferred(); }, "GcsServer.on_started_leading");
+  };
+  election_config.on_stopped_leading = [this]() {
+    RAY_LOG(FATAL) << "Lost GCS leadership lease! Aborting to prevent split-brain.";
+  };
+  election_config.on_new_leader = [](const std::string &leader_id) {
+    RAY_LOG(INFO) << "Observed GCS leader election lease holder: " << leader_id;
+  };
+
+  return std::make_unique<LeaderElector>(election_config);
+}
+
 void GcsServer::Start() {
   // Init KV Manager. This needs to be initialized first here so that
   // it can be used to retrieve the cluster ID.
   InitKVManager();
 
   if (!config_.ray_leader_elect_enabled) {
+    // Leader election disabled: this GCS is always the active leader.
     is_leader_ = true;
 
     // Load gcs tables data asynchronously.
@@ -276,25 +323,30 @@ void GcsServer::Start() {
                                      io_context_provider_.GetDefaultIOContext()});
                               },
                               io_context_provider_.GetDefaultIOContext()});
-  } else {
-    is_leader_ = false;
-
-    GetOrGenerateClusterId(
-        {[this](ClusterID cluster_id) {
-           rpc_server_.SetClusterId(cluster_id);
-           if (IsLeader()) {
-             RAY_LOG(INFO)
-                 << "GCS Server promoted during startup. Loading tables from Redis.";
-             auto gcs_init_data = std::make_shared<GcsInitData>(*gcs_table_storage_);
-             gcs_init_data->AsyncLoad({[this, gcs_init_data] { DoStart(*gcs_init_data); },
-                                       io_context_provider_.GetDefaultIOContext()});
-           } else {
-             auto empty_init_data = std::make_shared<GcsInitData>(*gcs_table_storage_);
-             DoStart(*empty_init_data);
-           }
-         },
-         io_context_provider_.GetDefaultIOContext()});
+    return;
   }
+
+  // Leader election enabled: boot in passive mode and start the background
+  // elector, which promotes this GCS via the on_started_leading callback once it
+  // acquires the lease.
+  is_leader_ = false;
+  elector_ = BuildLeaderElector();
+  elector_->Run();
+
+  GetOrGenerateClusterId({[this](ClusterID cluster_id) {
+                            rpc_server_.SetClusterId(cluster_id);
+                            // Always boot in passive mode with empty tables. Promotion
+                            // (loading tables and (re)initializing managers) is driven
+                            // exclusively by the on_started_leading callback via
+                            // DoStartLoadingDeferred, keeping a single promotion path. If
+                            // the elector already acquired leadership by now, its posted
+                            // promotion task will run right after DoStart sets
+                            // is_started_.
+                            auto empty_init_data =
+                                std::make_shared<GcsInitData>(*gcs_table_storage_);
+                            DoStart(*empty_init_data);
+                          },
+                          io_context_provider_.GetDefaultIOContext()});
 }
 
 void GcsServer::GetOrGenerateClusterId(
@@ -417,11 +469,30 @@ void GcsServer::DoStart(const GcsInitData &gcs_init_data) {
 }
 
 void GcsServer::DoStartLoadingDeferred() {
-  // TODO: the function is unused. To be updated once we integrate the leader election
-  // client with GCS server.
+  // Promotes this GCS from passive standby to active leader: loads the GCS tables from
+  // storage, (re)initializes the managers with the loaded data, flushes the cached local
+  // head node registration, and starts the leader-only periodic tasks.
+  //
+  // Must run on the main io_context (see the on_started_leading callback, which
+  // dispatches here). The leader election callback may fire more than once, so guard
+  // against re-entrancy to ensure promotion happens at most once.
   if (!is_started_.load()) {
+    // The base server bring-up (DoStart) has not finished yet. It is a rare condition.
+    // Retry shortly so we do not consume the idempotency guard before we can actually
+    // promote. Note this does NOT set promotion_started_, so a later attempt can still
+    // proceed.
     RAY_LOG(INFO)
-        << "GCS Server is not yet started. Deferring promotion load to DoStart.";
+        << "GCS Server is not yet started. Deferring promotion load until DoStart "
+           "completes.";
+    execute_after(
+        io_context_provider_.GetDefaultIOContext(),
+        [this]() { DoStartLoadingDeferred(); },
+        std::chrono::milliseconds(100));
+    return;
+  }
+  if (promotion_started_.exchange(true)) {
+    RAY_LOG(INFO) << "GCS Server promotion already in progress or completed. Ignoring "
+                     "duplicate promotion request.";
     return;
   }
   RAY_LOG(INFO) << "GCS Server promoting to Active Leader. Starting deferred loading.";
@@ -466,6 +537,9 @@ void GcsServer::DoStartLoadingDeferred() {
 void GcsServer::Stop() {
   if (!is_stopped_) {
     RAY_LOG(INFO) << "Stopping GCS server.";
+    if (elector_) {
+      elector_->Stop();
+    }
 
     // Stop the io_context monitor before tearing down the io_contexts it probes.
     if (io_context_monitor_thread_) {
