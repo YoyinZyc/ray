@@ -40,6 +40,13 @@ struct redisSSLContext;
 
 namespace ray::gcs {
 
+/// Sentinel embedded in the error message returned by the GCS fencing Lua script when a
+/// write is rejected because the caller's fencing epoch is stale (a newer leader has
+/// taken over). Both the Redis reply handling (which must treat it as a non-fatal,
+/// non-retryable application error) and the store client (which surfaces the
+/// split-brain) match on this exact substring.
+inline constexpr std::string_view kFencedWriteErrorSentinel = "GCS_FENCED";
+
 /// A simple reply wrapper for redis reply.
 class CallbackReply {
  public:

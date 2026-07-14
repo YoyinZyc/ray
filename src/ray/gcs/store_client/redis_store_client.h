@@ -176,6 +176,21 @@ class RedisStoreClient : public StoreClient {
   // \param callback The callback that will be called with a Status. OK means healthy.
   void AsyncCheckHealth(Postable<void(Status)> callback);
 
+  // Acquires a new fencing epoch via Redis INCR. The returned value is strictly
+  // increasing across all leaders sharing this Redis, so a newer leader always gets a
+  // larger epoch. Called at leadership promotion.
+  void AsyncAcquireFencingEpoch(Postable<void(int64_t)> callback);
+
+  // Enables fencing on all subsequent writes using `epoch`: each write is wrapped in a
+  // Lua script that rejects it if a larger epoch has since been recorded by a newer
+  // leader. Not thread safe; call on io_service_ before serving leader writes.
+  void SetFencingEpoch(int64_t epoch);
+
+  // Sets the callback invoked (at most once, on io_service_) when a write is fenced due
+  // to a stale epoch.
+  // The GCS server wires this to a fatal abort to stop the zombie leader.
+  void SetOnFencedWriteCallback(std::function<void()> callback);
+
  private:
   /// \class RedisScanner
   ///
@@ -281,6 +296,23 @@ class RedisStoreClient : public StoreClient {
   // hence command.args may become empty.
   void SendRedisCmdArgsAsKeys(RedisCommand command, RedisCallback redis_callback);
 
+  // True for mutating hash commands that must be fenced (HSET/HSETNX/HDEL).
+  static bool IsFencedWriteCommand(const std::string &command);
+
+  // Builds the Redis argv for `command`.
+  // When fencing is enabled and `command` is a write, rewrites it into a fencing EVAL;
+  // otherwise returns the plain argv unchanged.
+  // Call on io_service_.
+  std::vector<std::string> BuildRedisArgs(const RedisCommand &command) const;
+
+  // Wraps a write callback to detect a fencing rejection and report it via
+  // on_fenced_write_.
+  // Returns the callback unchanged when fencing is disabled.
+  RedisCallback WrapFencingCallback(RedisCallback redis_callback);
+
+  // The plain string key holding the shared fencing epoch.
+  std::string FencingKey() const;
+
   // HMGET external_storage_namespace@table_name key1 key2 ...
   // `keys` are chunked to multiple HMGET commands by
   // RAY_maximum_gcs_storage_operation_batch_size.
@@ -293,6 +325,15 @@ class RedisStoreClient : public StoreClient {
   RedisClientOptions options_;
 
   std::string external_storage_namespace_;
+
+  // Current fencing epoch; 0 disables fencing (default / single-head). io_service_ only.
+  int64_t fencing_epoch_ = 0;
+
+  // Invoked once when a write is fenced. Empty when fencing is off. io_service_ only.
+  std::function<void()> on_fenced_write_;
+
+  // Set once on_fenced_write_ has fired, so we report a split-brain at most once.
+  bool fenced_write_reported_ = false;
 
   // The following context writes everything to the primary shard.
   std::shared_ptr<RedisContext> primary_context_;

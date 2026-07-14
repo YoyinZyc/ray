@@ -37,6 +37,32 @@ namespace {
 
 constexpr std::string_view kClusterSeparator = "@";
 
+// Table name (a plain string key, not a HASH) storing the monotonically increasing
+// fencing epoch shared by all GCS leaders on a Redis instance. See the fencing token
+// design for GCS active-passive high availability.
+constexpr std::string_view kFencingEpochTable = "GCS_FENCING_EPOCH";
+
+// Atomically fences one GCS write. Invoked as:
+//   EVAL <script> 2 <fencing_key> <hash_key> <my_epoch> <inner_cmd> [<inner_arg>...]
+// Rejects the write if a newer leader has recorded a larger epoch; otherwise runs the
+// inner command. The 'GCS_FENCED' literal must match kFencedWriteErrorSentinel (enforced
+// by the static_assert below).
+constexpr std::string_view kFencingLuaScript = R"lua(
+local stored = tonumber(redis.call('GET', KEYS[1]) or '0')
+local mine = tonumber(ARGV[1])
+if stored > mine then
+  return redis.error_reply('GCS_FENCED stale fencing epoch')
+end
+local cmd = {ARGV[2], KEYS[2]}
+for i = 3, #ARGV do
+  cmd[#cmd + 1] = ARGV[i]
+end
+return redis.call(unpack(cmd))
+)lua";
+
+static_assert(kFencingLuaScript.find(kFencedWriteErrorSentinel) != std::string_view::npos,
+              "kFencingLuaScript must embed kFencedWriteErrorSentinel");
+
 // "[, ], -, ?, *, ^, \" are special chars in Redis pattern matching.
 // escape them with / according to the doc:
 // https://redis.io/commands/keys/
@@ -269,6 +295,9 @@ void RedisStoreClient::SendRedisCmdWithKeys(std::vector<std::string> keys,
                                             RedisCommand command,
                                             RedisCallback redis_callback) {
   RAY_CHECK(!keys.empty());
+  // Wrap the callback so a fencing rejection is surfaced as a split-brain signal.
+  // No-op when fencing is disabled.
+  redis_callback = WrapFencingCallback(std::move(redis_callback));
   auto concurrency_keys =
       ray::move_mapped(std::move(keys), [&command](std::string &&key) {
         return RedisConcurrencyKey{command.redis_key.table_name, std::move(key)};
@@ -294,9 +323,10 @@ void RedisStoreClient::SendRedisCmdWithKeys(std::vector<std::string> keys,
         return;
       }
     }
-    // Send the actual request
+    // Send the actual request. BuildRedisArgs rewrites writes into a fencing EVAL when
+    // fencing is enabled; otherwise it returns the plain argv unchanged.
     primary_context_->RunArgvAsync(
-        command.ToRedisArgs(),
+        BuildRedisArgs(command),
         [this,
          concurrency_keys,  // Copied!
          redis_callback = std::move(redis_callback)](auto reply) {
@@ -462,6 +492,94 @@ void RedisStoreClient::AsyncGetNextJobID(Postable<void(int)> callback) {
         auto job_id = static_cast<int>(reply->ReadAsInteger());
         std::move(callback).Post("GcsStore.GetNextJobID", job_id);
       });
+}
+
+std::string RedisStoreClient::FencingKey() const {
+  // A plain string key (not a HASH), namespaced like the other GCS keys.
+  return RedisKey{external_storage_namespace_, std::string(kFencingEpochTable)}
+      .ToString();
+}
+
+void RedisStoreClient::AsyncAcquireFencingEpoch(Postable<void(int64_t)> callback) {
+  // INCR atomically bumps and returns the shared fencing counter, so each promoted
+  // leader gets a strictly larger epoch than every previous leader.
+  std::vector<std::string> args = {"INCR", FencingKey()};
+  primary_context_->RunArgvAsync(
+      std::move(args),
+      [callback =
+           std::move(callback)](const std::shared_ptr<CallbackReply> &reply) mutable {
+        std::move(callback).Post("RedisStoreClient.AsyncAcquireFencingEpoch",
+                                 reply->ReadAsInteger());
+      });
+}
+
+void RedisStoreClient::SetFencingEpoch(int64_t epoch) {
+  RAY_CHECK_GT(epoch, 0) << "Fencing epoch must be positive; 0 means fencing disabled.";
+  fencing_epoch_ = epoch;
+  RAY_LOG(INFO) << "GCS Redis fencing enabled with epoch " << epoch;
+}
+
+void RedisStoreClient::SetOnFencedWriteCallback(std::function<void()> callback) {
+  on_fenced_write_ = std::move(callback);
+}
+
+bool RedisStoreClient::IsFencedWriteCommand(const std::string &command) {
+  // Only mutating hash commands need fencing. Reads (HGET/HMGET/HSCAN/HEXISTS) and the
+  // fencing INCR itself are never fenced.
+  return command == "HSET" || command == "HSETNX" || command == "HDEL";
+}
+
+std::vector<std::string> RedisStoreClient::BuildRedisArgs(
+    const RedisCommand &command) const {
+  std::vector<std::string> plain_args = command.ToRedisArgs();
+  if (fencing_epoch_ == 0 || !IsFencedWriteCommand(command.command)) {
+    // Fencing disabled or not a write command: use the plain argv (single-head fast
+    // path and all reads are unaffected).
+    return plain_args;
+  }
+  // Rewrite `<CMD> <hash_key> <args...>` into:
+  //   EVAL <script> 2 <fencing_key> <hash_key> <epoch> <CMD> <args...>
+  RAY_CHECK_GE(plain_args.size(), 2u);
+  std::vector<std::string> eval_args;
+  eval_args.reserve(plain_args.size() + 5);
+  eval_args.emplace_back("EVAL");
+  eval_args.emplace_back(kFencingLuaScript);
+  eval_args.emplace_back("2");
+  eval_args.emplace_back(FencingKey());                    // KEYS[1]
+  eval_args.emplace_back(plain_args[1]);                   // KEYS[2] = the HASH key
+  eval_args.emplace_back(std::to_string(fencing_epoch_));  // ARGV[1]
+  eval_args.emplace_back(plain_args[0]);                   // ARGV[2] = inner command
+  for (size_t i = 2; i < plain_args.size(); ++i) {
+    eval_args.emplace_back(plain_args[i]);  // ARGV[3..] = inner args
+  }
+  return eval_args;
+}
+
+RedisCallback RedisStoreClient::WrapFencingCallback(RedisCallback redis_callback) {
+  if (fencing_epoch_ == 0) {
+    return redis_callback;
+  }
+  return [this, redis_callback = std::move(redis_callback)](
+             const std::shared_ptr<CallbackReply> &reply) {
+    if (reply && reply->IsError() &&
+        absl::StrContains(reply->ReadAsStatus().ToString(), kFencedWriteErrorSentinel)) {
+      RAY_LOG(ERROR) << "GCS Redis write was fenced (stale epoch " << fencing_epoch_
+                     << "): a newer leader has taken over. This indicates a "
+                        "split-brain; aborting to protect shared GCS storage.";
+      if (!fenced_write_reported_) {
+        fenced_write_reported_ = true;
+        if (on_fenced_write_) {
+          on_fenced_write_();
+        }
+      }
+      // The write did not happen; skip the inner callback (it assumes a success reply,
+      // e.g. AsyncPut reads it as an integer). on_fenced_write_ aborts the process.
+      return;
+    }
+    if (redis_callback) {
+      redis_callback(reply);
+    }
+  };
 }
 
 void RedisStoreClient::AsyncGetKeys(const std::string &table_name,

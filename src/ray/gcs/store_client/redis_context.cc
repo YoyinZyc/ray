@@ -45,7 +45,16 @@ CallbackReply::CallbackReply(const redisReply &redis_reply)
     break;
   }
   case REDIS_REPLY_ERROR: {
-    RAY_LOG(FATAL) << "Got an error in redis reply: " << redis_reply.str;
+    const std::string error_str(redis_reply.str, redis_reply.len);
+    // An intentional fencing rejection (stale GCS leader epoch) is an expected,
+    // recoverable application error: store it so the callback can surface the
+    // split-brain via ReadAsStatus() instead of crashing here. Any other Redis error is
+    // unexpected and remains fatal, preserving the previous fail-fast behavior.
+    if (absl::StrContains(error_str, kFencedWriteErrorSentinel)) {
+      status_reply_ = Status::RedisError(error_str);
+    } else {
+      RAY_LOG(FATAL) << "Got an error in redis reply: " << redis_reply.str;
+    }
     break;
   }
   case REDIS_REPLY_INTEGER: {
@@ -129,7 +138,8 @@ int64_t CallbackReply::ReadAsInteger() const {
 }
 
 Status CallbackReply::ReadAsStatus() const {
-  RAY_CHECK(reply_type_ == REDIS_REPLY_STATUS) << "Unexpected type: " << reply_type_;
+  RAY_CHECK(reply_type_ == REDIS_REPLY_STATUS || reply_type_ == REDIS_REPLY_ERROR)
+      << "Unexpected type: " << reply_type_;
   return status_reply_;
 }
 
@@ -182,8 +192,16 @@ void RedisRequestContext::RedisResponseFn(redisAsyncContext *async_context,
                                           void *privdata) {
   auto *request_cxt = static_cast<RedisRequestContext *>(privdata);
   auto redis_reply = reinterpret_cast<redisReply *>(raw_reply);
+  // An application-level fencing rejection is an intentional, non-retryable error: the
+  // GCS write carried a stale fencing epoch (a newer leader took over). Deliver it to
+  // the callback (which surfaces the split-brain) rather than retrying and crashing.
+  const bool is_fencing_error =
+      redis_reply != nullptr && redis_reply->type == REDIS_REPLY_ERROR &&
+      redis_reply->str != nullptr &&
+      absl::StrContains(redis_reply->str, kFencedWriteErrorSentinel);
   // Error happened.
-  if (redis_reply == nullptr || redis_reply->type == REDIS_REPLY_ERROR) {
+  if (!is_fencing_error &&
+      (redis_reply == nullptr || redis_reply->type == REDIS_REPLY_ERROR)) {
     auto error_msg = redis_reply ? redis_reply->str
                                  : (async_context ? async_context->errstr
                                                   : "Redis connection unavailable");
