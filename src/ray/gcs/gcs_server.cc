@@ -403,6 +403,10 @@ void GcsServer::GetOrGenerateClusterId(
          instrumented_io_context &io_ctx = continuation.io_context();
          ClusterID cluster_id = ClusterID::FromRandom();
          RAY_LOG(INFO).WithField(cluster_id) << "Generated new cluster ID.";
+         // This write happens during Start(), before leadership promotion installs
+         // the fencing epoch. It uses overwrite=false/HSETNX so only one cold-start
+         // candidate can initialize the cluster ID. The loser fails fast, which is
+         // safe and avoids split-brain corruption without fencing.
          kv_manager_->GetInstance().Put(
              kClusterIdNamespace,
              kClusterIdKey,

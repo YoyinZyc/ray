@@ -482,6 +482,11 @@ void RedisStoreClient::AsyncGetNextJobID(Postable<void(int)> callback) {
   // Note: This is not a HASH! It's a simple key-value pair.
   // Key: "RAYexternal_storage_namespace@JobCounter"
   // Value: The next job ID.
+  //
+  // AsyncGetNextJobID intentionally bypasses fencing. INCRBY is atomic and monotonic,
+  // so stale leaders can only skip IDs, not corrupt state or return duplicates.
+  // Job ID allocation is also leader-gated at the RPC layer, and fencing would force
+  // a multi-key Redis EVAL with CROSSSLOT risk for no correctness benefit.
   RedisCommand command = {
       "INCRBY", RedisKey{external_storage_namespace_, "JobCounter"}, {"1"}};
 
