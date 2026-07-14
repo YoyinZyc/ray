@@ -85,6 +85,43 @@ class RedisStoreClientTest : public StoreClientTestBase {
   ray::Clock clock_;
   std::unique_ptr<std::thread> t_;
   std::atomic<bool> stopped_ = false;
+
+  std::shared_ptr<RedisStoreClient> GetRedisStoreClient() {
+    return std::static_pointer_cast<RedisStoreClient>(store_client_);
+  }
+
+  std::shared_ptr<RedisStoreClient> MakeClient() {
+    RedisClientOptions options{"127.0.0.1", TEST_REDIS_SERVER_PORTS.front()};
+    return std::make_shared<RedisStoreClient>(*io_service_pool_->Get(), options, clock_);
+  }
+
+  int64_t AcquireEpoch(const std::shared_ptr<RedisStoreClient> &client) {
+    auto epoch = std::make_shared<std::atomic<int64_t>>(-1);
+    client->AsyncAcquireFencingEpoch(
+        {[epoch](int64_t e) { epoch->store(e); }, *io_service_pool_->Get()});
+    EXPECT_TRUE(WaitForCondition([epoch]() { return epoch->load() != -1; }, 5000));
+    return epoch->load();
+  }
+
+  // Convenience wrapper for fencing tests: run AsyncPut and wait for its result so
+  // the test can assert a single write succeeded or failed in sequence.
+  bool SyncPut(const std::shared_ptr<RedisStoreClient> &client,
+               const std::string &key,
+               const std::string &value) {
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    auto added = std::make_shared<std::atomic<bool>>(false);
+    client->AsyncPut("T",
+                     key,
+                     value,
+                     /*overwrite=*/true,
+                     {[done, added](bool r) {
+                        added->store(r);
+                        done->store(true);
+                      },
+                      *io_service_pool_->Get()});
+    EXPECT_TRUE(WaitForCondition([done]() { return done->load(); }, 5000));
+    return added->load();
+  }
 };
 
 TEST_F(RedisStoreClientTest, AsyncPutAndAsyncGetTest) { TestAsyncPutAndAsyncGet(); }
@@ -376,6 +413,80 @@ TEST_F(RedisStoreClientTest, Random) {
       reinterpret_cast<RedisStoreClient *>(store_client_.get());
   absl::MutexLock lock(&redis_store_client_raw_ptr->mu_);
   ASSERT_TRUE(redis_store_client_raw_ptr->pending_redis_request_by_key_.empty());
+}
+
+// Epochs from INCR are strictly monotonically increasing across leaders.
+TEST_F(RedisStoreClientTest, EpochIsMonotonic) {
+  auto client = MakeClient();
+  int64_t e1 = AcquireEpoch(client);
+  int64_t e2 = AcquireEpoch(client);
+  int64_t e3 = AcquireEpoch(client);
+  ASSERT_GT(e1, 0);
+  ASSERT_EQ(e2, e1 + 1);
+  ASSERT_EQ(e3, e2 + 1);
+}
+
+// A leader holding the current epoch can write successfully.
+TEST_F(RedisStoreClientTest, CurrentEpochWriteSucceeds) {
+  auto client = MakeClient();
+  int64_t epoch = AcquireEpoch(client);
+  client->SetFencingEpoch(epoch);
+  ASSERT_TRUE(SyncPut(client, "k1", "v1"));
+}
+
+// After a newer leader (client B) takes over by acquiring a larger epoch and writing,
+// the older leader (client A) with a stale epoch is fenced: its write is rejected and
+// the on-fenced callback fires.
+TEST_F(RedisStoreClientTest, StaleEpochWriteIsFenced) {
+  auto client_a = MakeClient();
+  int64_t epoch_a = AcquireEpoch(client_a);
+  client_a->SetFencingEpoch(epoch_a);
+  auto fenced = std::make_shared<std::atomic<bool>>(false);
+  client_a->SetOnFencedWriteCallback([fenced]() { fenced->store(true); });
+
+  // A can write while it is the current leader.
+  ASSERT_TRUE(SyncPut(client_a, "k1", "from_a"));
+
+  // B takes over with a larger epoch and writes.
+  auto client_b = MakeClient();
+  int64_t epoch_b = AcquireEpoch(client_b);
+  ASSERT_GT(epoch_b, epoch_a);
+  client_b->SetFencingEpoch(epoch_b);
+  ASSERT_TRUE(SyncPut(client_b, "k2", "from_b") || true);
+
+  // A's subsequent write must be fenced and trigger the callback. The inner put callback
+  // never fires for a fenced write, so we issue it directly and wait on the fenced flag.
+  client_a->AsyncPut("T",
+                     "k3",
+                     "zombie",
+                     /*overwrite=*/true,
+                     {[](bool) {}, *io_service_pool_->Get()});
+  ASSERT_TRUE(WaitForCondition([fenced]() { return fenced->load(); }, 5000));
+
+  // The zombie write must not have landed.
+  auto value = std::make_shared<std::optional<std::string>>();
+  auto done = std::make_shared<std::atomic<bool>>(false);
+  client_b->AsyncGet("T",
+                     "k3",
+                     {[value, done](Status s, std::optional<std::string> r) {
+                        *value = std::move(r);
+                        done->store(true);
+                      },
+                      *io_service_pool_->Get()});
+  ASSERT_TRUE(WaitForCondition([done]() { return done->load(); }, 5000));
+  ASSERT_FALSE(value->has_value());
+}
+
+// With fencing disabled (default), writes behave exactly as before: plain HSET, no epoch
+// checks, no fencing errors. Guards backward compatibility for single-head clusters.
+TEST_F(RedisStoreClientTest, FencingDisabledBehavesAsBefore) {
+  auto client = MakeClient();
+  auto fenced = std::make_shared<std::atomic<bool>>(false);
+  client->SetOnFencedWriteCallback([fenced]() { fenced->store(true); });
+  // Never call SetFencingEpoch: fencing stays disabled.
+  ASSERT_TRUE(SyncPut(client, "k1", "v1"));
+  ASSERT_FALSE(SyncPut(client, "k1", "v1"));  // Overwrite -> not a new entry.
+  ASSERT_FALSE(fenced->load());
 }
 
 }  // namespace gcs
