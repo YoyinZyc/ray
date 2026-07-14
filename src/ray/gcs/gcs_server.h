@@ -57,6 +57,7 @@ namespace gcs {
 
 class LeaderElector;
 class LeaderLeaseClientInterface;
+class RedisStoreClient;
 
 struct GcsServerConfig {
   std::string grpc_server_name = "GcsServer";
@@ -202,6 +203,11 @@ class GcsServer {
 
   void DoStartLoadingDeferred();
 
+  /// Loads the GCS tables from storage and (re)initializes the managers on the main
+  /// io_context. Called by DoStartLoadingDeferred after the fencing epoch (if enabled)
+  /// has been acquired and applied.
+  void DoLoadAndInitialize();
+
   /// Build and return the leader elector used to run active-passive GCS leader
   /// election. Uses the injected mock lease client if provided (for tests),
   /// otherwise creates a real lease client via the factory.
@@ -329,6 +335,10 @@ class GcsServer {
   rpc::CoreWorkerClientPool worker_client_pool_;
   std::shared_ptr<ClusterResourceScheduler> cluster_resource_scheduler_;
   std::unique_ptr<gcs::GcsTableStorage> gcs_table_storage_;
+  /// The Redis-backed store client, only set when storage_type_ is REDIS_PERSIST.
+  /// Kept so the fencing epoch (for active-passive split-brain protection) can be
+  /// acquired and applied at leadership promotion. Null in in-memory mode.
+  std::shared_ptr<RedisStoreClient> redis_store_client_;
   /// gcs_resource_manager_ depends on cluster_lease_manager_.
   std::unique_ptr<GcsResourceManager> gcs_resource_manager_;
   std::unique_ptr<GcsAutoscalerStateManager> gcs_autoscaler_state_manager_;

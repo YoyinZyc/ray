@@ -192,6 +192,9 @@ GcsServer::GcsServer(const ray::gcs::GcsServerConfig &config,
         RayConfig::instance().gcs_redis_heartbeat_interval_milliseconds(),
         "GCSServer.redis_health_check");
 
+    // Keep a typed handle so leadership promotion can acquire and apply the fencing
+    // epoch for active-passive split-brain protection.
+    redis_store_client_ = redis_store_client;
     store_client = redis_store_client;
     break;
   }
@@ -514,6 +517,33 @@ void GcsServer::DoStartLoadingDeferred() {
     return;
   }
   RAY_LOG(INFO) << "GCS Server promoting to Active Leader. Starting deferred loading.";
+
+  // Acquire and apply the Redis fencing epoch before loading any data or serving
+  // leader writes. This guarantees that every write this new leader issues carries a
+  // strictly larger epoch than any previous leader, so a stepped-down "zombie" leader's
+  // in-flight writes are rejected by Redis, preventing split-brain corruption of the
+  // shared GCS storage. Only applies to the Redis backend with fencing enabled; the
+  // in-memory backend and single-head clusters skip this entirely.
+  const bool fencing_enabled = redis_store_client_ != nullptr &&
+                               RayConfig::instance().LEADER_ELECT() &&
+                               RayConfig::instance().gcs_redis_fencing_enabled();
+  if (fencing_enabled) {
+    redis_store_client_->AsyncAcquireFencingEpoch(
+        {[this](int64_t epoch) {
+           redis_store_client_->SetFencingEpoch(epoch);
+           redis_store_client_->SetOnFencedWriteCallback([]() {
+             RAY_LOG(FATAL) << "GCS write fenced by a newer leader (split-brain "
+                               "detected). Aborting to protect shared GCS storage.";
+           });
+           DoLoadAndInitialize();
+         },
+         io_context_provider_.GetDefaultIOContext()});
+  } else {
+    DoLoadAndInitialize();
+  }
+}
+
+void GcsServer::DoLoadAndInitialize() {
   auto gcs_init_data = std::make_shared<GcsInitData>(*gcs_table_storage_);
   gcs_init_data->AsyncLoad(
       {[this, gcs_init_data] {
