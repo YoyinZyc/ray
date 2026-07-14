@@ -179,6 +179,14 @@ int main(int argc, char *argv[]) {
   gcs_server_config.session_name = session_name;
 
   if (RayConfig::instance().LEADER_ELECT()) {
+    // The Redis fencing token is what protects the shared GCS storage from
+    // split-brain writes by a stepped-down leader. Active-passive HA is unsafe
+    // without it, so require fencing whenever leader election is enabled and fail
+    // fast at startup rather than run in an unsafe configuration.
+    RAY_CHECK(RayConfig::instance().gcs_redis_fencing_enabled())
+        << "gcs_redis_fencing_enabled must be true when LEADER_ELECT is enabled: "
+           "the Redis fencing token is required to prevent split-brain writes to "
+           "the shared GCS storage in active-passive high-availability mode.";
     gcs_server_config.ray_leader_elect_enabled = true;
     gcs_server_config.gcs_leader_lease_namespace =
         RayConfig::instance().leader_elect_resource_namespace();
