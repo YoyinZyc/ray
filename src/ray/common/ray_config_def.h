@@ -1135,6 +1135,14 @@ RAY_CONFIG(int32_t, leader_elect_renew_deadline_seconds, 10)
 // Retry period for GCS leader election (in seconds).
 RAY_CONFIG(int32_t, leader_elect_retry_period_seconds, 2)
 
+// Whether to enable the Redis fencing token for GCS active-passive high availability.
+// When enabled (in addition to LEADER_ELECT), every GCS write command to Redis carries
+// a monotonically increasing fencing epoch acquired at leadership promotion. Redis
+// rejects any write whose epoch is stale (i.e. from a stepped-down "zombie" leader),
+// preventing split-brain writes to the shared GCS storage. Has no effect unless
+// LEADER_ELECT is also true.
+RAY_CONFIG(bool, gcs_redis_fencing_enabled, true)
+
 // Whether to enable the ray event to send to the event aggregator.
 // Currently, only task events are supported.
 // TODO(myan): #54515 Remove this flag after the task events are fully migrated to the
