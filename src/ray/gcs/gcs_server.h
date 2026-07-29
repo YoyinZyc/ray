@@ -183,6 +183,13 @@ class GcsServer {
 
   void DoStart(const GcsInitData &gcs_init_data);
 
+  /// Promote a passive GCS to active leader: load all GCS tables from storage,
+  /// flip is_leader_ to true, flush the cached local head node, perform the
+  /// active-only shared-storage writes, and start the active-only periodic tasks.
+  /// Currently invoked only by tests via a hook; it will be driven by the leader
+  /// election client's promotion callback in a later PR.
+  void DoStartLoadingDeferred();
+
   /// Register all GCS gRPC services on rpc_server_. This is the single, centralized
   /// place where every service is registered, so whether a service is leader-gated
   /// (via MaybeGate) or intentionally exempt is explicit and auditable in one spot.
@@ -255,6 +262,14 @@ class GcsServer {
 
   /// Initialize KV manager.
   void InitKVManager();
+
+  /// Persist this GCS server's pid to the shared KV store (used for GCS process
+  /// metrics). Active GCS only; a passive GCS defers this until promotion.
+  void WriteGcsPid();
+
+  /// Persist the autoscaler-v2 feature flag to the shared KV store. Active GCS
+  /// only; a passive GCS defers this until promotion.
+  void WriteAutoscalerV2Flag();
 
   /// Initialize KV service.
   void InitKVService();

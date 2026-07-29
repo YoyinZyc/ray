@@ -177,6 +177,10 @@ int main(int argc, char *argv[]) {
   gcs_server_config.log_dir = log_dir;
   gcs_server_config.raylet_config_list = config_list;
   gcs_server_config.session_name = session_name;
+  // Drive active-passive leader election from the LEADER_ELECT config (overridable
+  // via the RAY_LEADER_ELECT env var), keeping the C++ config the single source of
+  // truth. Defaults to false, so a normal single-GCS cluster is unaffected.
+  gcs_server_config.ray_leader_elect_enabled = RayConfig::instance().LEADER_ELECT();
 
   // Create individual metrics
   auto actor_by_state_gauge = ray::GetActorByStateGaugeMetric();
