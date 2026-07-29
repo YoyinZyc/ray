@@ -302,30 +302,49 @@ void GcsServer::GetOrGenerateClusterId(
       kClusterIdKey,
       {[this, continuation = std::move(continuation)](
            std::optional<std::string> provided_cluster_id) mutable {
-         if (!provided_cluster_id.has_value()) {
-           instrumented_io_context &io_ctx = continuation.io_context();
-           ClusterID cluster_id = ClusterID::FromRandom();
-           RAY_LOG(INFO).WithField(cluster_id) << "Generated new cluster ID.";
-           kv_manager_->GetInstance().Put(
-               kClusterIdNamespace,
-               kClusterIdKey,
-               cluster_id.Binary(),
-               false,
-               {[cluster_id,
-                 continuation = std::move(continuation)](bool added_entry) mutable {
-                  RAY_CHECK(added_entry) << "Failed to persist new cluster ID.";
-                  std::move(continuation)
-                      .Dispatch("GcsServer.GetOrGenerateClusterId.continuation",
-                                cluster_id);
-                },
-                io_ctx});
-         } else {
+         // 1. Existing cluster ID found in storage: use it.
+         if (provided_cluster_id.has_value()) {
            ClusterID cluster_id = ClusterID::FromBinary(provided_cluster_id.value());
            RAY_LOG(INFO).WithField(cluster_id)
                << "Using existing cluster ID from external storage.";
            std::move(continuation)
                .Dispatch("GcsServer.GetOrGenerateClusterId.continuation", cluster_id);
+           return;
          }
+
+         // 2. No cluster ID yet, and this GCS is a passive standby: it must not write
+         // the cluster ID. Wait for the active leader to write it, then retry.
+         if (config_.ray_leader_elect_enabled && !IsLeader()) {
+           RAY_LOG(INFO) << "Cluster ID not found in storage. Waiting for the active "
+                            "GCS leader to write it...";
+           auto &io_ctx = continuation.io_context();
+           execute_after(
+               io_ctx,
+               [this, continuation = std::move(continuation)]() mutable {
+                 GetOrGenerateClusterId(std::move(continuation));
+               },
+               std::chrono::seconds(1));
+           return;
+         }
+
+         // 3. No cluster ID yet, and this GCS is the active leader (or leader election
+         // is disabled): generate and persist a new one.
+         instrumented_io_context &io_ctx = continuation.io_context();
+         ClusterID cluster_id = ClusterID::FromRandom();
+         RAY_LOG(INFO).WithField(cluster_id) << "Generated new cluster ID.";
+         kv_manager_->GetInstance().Put(
+             kClusterIdNamespace,
+             kClusterIdKey,
+             cluster_id.Binary(),
+             false,
+             {[cluster_id,
+               continuation = std::move(continuation)](bool added_entry) mutable {
+                RAY_CHECK(added_entry) << "Failed to persist new cluster ID.";
+                std::move(continuation)
+                    .Dispatch("GcsServer.GetOrGenerateClusterId.continuation",
+                              cluster_id);
+              },
+              io_ctx});
        },
        io_context});
 }
@@ -899,6 +918,14 @@ void GcsServer::InitKVManager() {
       config_.raylet_config_list,
       io_context);
 
+  // A passive GCS must not write to shared storage; only the active GCS registers
+  // its pid here. A passive GCS defers this to promotion (DoStartLoadingDeferred).
+  if (!config_.ray_leader_elect_enabled) {
+    WriteGcsPid();
+  }
+}
+
+void GcsServer::WriteGcsPid() {
   kv_manager_->GetInstance().Put(
       "",
       kGcsPidKey,
@@ -979,7 +1006,7 @@ void GcsServer::InitGcsWorkerManager(const GcsInitData &gcs_init_data) {
   gcs_worker_manager_->RestoreDeadWorkerIdsQueue(gcs_init_data);
 }
 
-void GcsServer::InitGcsAutoscalerStateManager(const GcsInitData &gcs_init_data) {
+void GcsServer::WriteAutoscalerV2Flag() {
   RAY_CHECK(kv_manager_) << "kv_manager_ is not initialized.";
   auto v2_enabled =
       std::to_string(static_cast<int>(RayConfig::instance().enable_autoscaler_v2()));
@@ -1011,6 +1038,17 @@ void GcsServer::InitGcsAutoscalerStateManager(const GcsInitData &gcs_init_data) 
          }
        },
        io_context_provider_.GetDefaultIOContext()});
+}
+
+void GcsServer::InitGcsAutoscalerStateManager(const GcsInitData &gcs_init_data) {
+  RAY_CHECK(kv_manager_) << "kv_manager_ is not initialized.";
+
+  // A passive GCS must not write to shared storage; only the active GCS persists the
+  // autoscaler-v2 flag here. A passive GCS defers this to promotion
+  // (DoStartLoadingDeferred).
+  if (!config_.ray_leader_elect_enabled) {
+    WriteAutoscalerV2Flag();
+  }
 
   gcs_autoscaler_state_manager_ = std::make_unique<GcsAutoscalerStateManager>(
       config_.session_name,
