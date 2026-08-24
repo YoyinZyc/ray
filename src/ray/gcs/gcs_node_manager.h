@@ -221,13 +221,11 @@ class GcsNodeManager : public rpc::NodeInfoGcsServiceHandler {
   /// \param gcs_init_data.
   void Initialize(const GcsInitData &gcs_init_data);
 
-  /// Cache the local head node registration in-memory when in passive mode.
-  /// This is called by LeaderGatedNodeInfoHandler to centralize passive mode logic.
-  /// Only the local head node may be cached, and only while this GCS is passive;
-  /// both invariants are asserted to catch misuse (e.g. caching a worker node or
-  /// caching while leader).
+  /// Cache the local head node in-memory while passive (called by
+  /// LeaderGatedNodeInfoHandler). Asserts the node is the head and the GCS is
+  /// passive to catch misuse.
   ///
-  /// \param node_info The head node info to cache. Must be the local head node.
+  /// \param node_info The local head node info to cache.
   void CachePassiveLocalNode(const rpc::GcsNodeInfo &node_info) {
     RAY_CHECK(!is_leader_fn_())
         << "CachePassiveLocalNode must only be called while the GCS is passive.";
