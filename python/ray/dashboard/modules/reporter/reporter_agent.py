@@ -31,6 +31,10 @@ from ray._common.utils import (
     get_or_create_event_loop,
 )
 from ray._private import utils
+from ray._private.gcs_passive_utils import (
+    PassiveLatch,
+    is_refused_by_passive_gcs,
+)
 from ray._private.metrics_agent import Gauge, MetricsAgent, Record
 from ray._private.ray_constants import (
     DEBUG_AUTOSCALING_STATUS,
@@ -38,6 +42,7 @@ from ray._private.ray_constants import (
     env_bool,
     env_integer,
 )
+from ray._private.runtime_env.redaction import redact_serialized_runtime_env
 from ray._private.telemetry.open_telemetry_metric_recorder import (
     OpenTelemetryMetricRecorder,
 )
@@ -472,6 +477,31 @@ PSUTIL_PROCESS_ATTRS = (
 )
 
 
+# `setup_worker.py` receives the runtime env context, including `env_vars`, on its
+# command line.
+_RUNTIME_ENV_CONTEXT_ARG = "--serialized-runtime-env-context="
+
+
+def _redact_cmdline(cmdline: Optional[List[str]]) -> Optional[List[str]]:
+    """Mask `env_vars` values in a process command line."""
+    if not cmdline:
+        return cmdline
+    return [
+        _RUNTIME_ENV_CONTEXT_ARG
+        + redact_serialized_runtime_env(arg[len(_RUNTIME_ENV_CONTEXT_ARG) :])
+        if arg.startswith(_RUNTIME_ENV_CONTEXT_ARG)
+        else arg
+        for arg in cmdline
+    ]
+
+
+def _process_as_dict(proc: psutil.Process) -> dict:
+    """`proc.as_dict(PSUTIL_PROCESS_ATTRS)` with secrets masked in the cmdline."""
+    info = proc.as_dict(attrs=PSUTIL_PROCESS_ATTRS)
+    info["cmdline"] = _redact_cmdline(info.get("cmdline"))
+    return info
+
+
 class ReporterAgent(
     dashboard_utils.DashboardAgentModule,
     reporter_pb2_grpc.ReporterServiceServicer,
@@ -526,6 +556,14 @@ class ReporterAgent(
         self._open_telemetry_metric_recorder = None
         self._export_failure_warned = set()
         self._session_name = dashboard_agent.session_name
+        self._physical_stats_passive_latch = PassiveLatch(
+            "node physical stats",
+            logger,
+            action_desc_passive=(
+                "GCS is in passive mode. Skipping publishing node physical stats until promoted."
+            ),
+            action_desc_promoted="GCS was promoted to leader. Resumed publishing node physical stats.",
+        )
         if not self._metrics_collection_disabled:
             stats_exporter = prometheus_exporter.new_stats_exporter(
                 prometheus_exporter.Options(
@@ -1170,7 +1208,7 @@ class ReporterAgent(
                         continue
 
                     # Get basic process info
-                    worker_info = w.as_dict(attrs=PSUTIL_PROCESS_ATTRS)
+                    worker_info = _process_as_dict(w)
 
                     # Add GPU information if available
                     worker_pid = worker_info["pid"]
@@ -1225,7 +1263,7 @@ class ReporterAgent(
             if not self._gcs_proc or self._gcs_pid != self._gcs_proc.pid:
                 self._gcs_proc = psutil.Process(self._gcs_pid)
             if self._gcs_proc:
-                dictionary = self._gcs_proc.as_dict(attrs=PSUTIL_PROCESS_ATTRS)
+                dictionary = _process_as_dict(self._gcs_proc)
                 return dictionary
         return {}
 
@@ -1234,13 +1272,13 @@ class ReporterAgent(
         if raylet_proc is None:
             return None
         else:
-            return raylet_proc.as_dict(attrs=PSUTIL_PROCESS_ATTRS)
+            return _process_as_dict(raylet_proc)
 
     def _get_agent(self):
         # Current proc == agent proc
         if not self._agent_proc:
             self._agent_proc = psutil.Process()
-        return self._agent_proc.as_dict(attrs=PSUTIL_PROCESS_ATTRS)
+        return _process_as_dict(self._agent_proc)
 
     def _get_load_avg(self):
         if sys.platform == "win32":
@@ -2092,9 +2130,13 @@ class ReporterAgent(
                 await self._gcs_client.async_publish_node_resource_usage(
                     self._key, json_payload
                 )
+                self._physical_stats_passive_latch.promoted()
 
-            except Exception:
-                logger.exception("Error publishing node physical stats.")
+            except Exception as e:
+                if not is_refused_by_passive_gcs(
+                    e, latch=self._physical_stats_passive_latch
+                ):
+                    logger.exception("Error publishing node physical stats.")
 
             await asyncio.sleep(reporter_consts.REPORTER_UPDATE_INTERVAL_MS / 1000)
 
